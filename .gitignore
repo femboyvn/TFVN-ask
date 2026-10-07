@@ -1,0 +1,5 @@
+.env
+.knownsphere_conversations.json
+.knownsphere_memories.json
+*.json.tmp
+target/

@@ -1,8 +1,12 @@
-//! Read-only tools backed by free public weather and quote APIs.
+//! Read-only chat tools for live information and local utilities.
 
+use crate::calculator;
+use crate::knowledge;
+use rand::{rngs::OsRng, Rng};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub fn tool_definitions() -> Vec<Value> {
     vec![
@@ -21,6 +25,41 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema":{"type":"object","properties":{
                 "kind":{"type":"string","enum":["random","daily"],"description":"Use daily for quote of the day, otherwise random"}
             },"additionalProperties":false}
+        }),
+        json!({
+            "name":"current_time",
+            "description":"Get the current UTC date and time, plus a Discord timestamp that each viewer sees in their own local timezone. Use for questions about the current time or date. Do not infer a named city's timezone from this result.",
+            "inputSchema":{"type":"object","properties":{},"additionalProperties":false}
+        }),
+        json!({
+            "name":"calculate",
+            "description":"Calculate an arithmetic expression using +, -, *, /, parentheses, and decimal numbers. Use for arithmetic instead of guessing the result.",
+            "inputSchema":{"type":"object","properties":{
+                "expression":{"type":"string","minLength":1,"maxLength":200,"description":"Arithmetic expression, for example (12.5 + 7.5) / 2"}
+            },"required":["expression"],"additionalProperties":false}
+        }),
+        json!({
+            "name":"roll_dice",
+            "description":"Roll dice with fresh random values and return every roll and the total. Defaults to one six-sided die.",
+            "inputSchema":{"type":"object","properties":{
+                "count":{"type":"integer","minimum":1,"maximum":20,"description":"Number of dice; defaults to 1"},
+                "sides":{"type":"integer","minimum":2,"maximum":1000,"description":"Sides per die; defaults to 6"},
+                "modifier":{"type":"integer","minimum":-1000,"maximum":1000,"description":"Value added to the roll total; defaults to 0"}
+            },"additionalProperties":false}
+        }),
+        json!({
+            "name":"define_word",
+            "description":"Look up short English dictionary definitions and pronunciation for a word. Return the dictionary source link. Ask for the word if missing.",
+            "inputSchema":{"type":"object","properties":{
+                "word":{"type":"string","minLength":1,"maxLength":60,"description":"English word to define"}
+            },"required":["word"],"additionalProperties":false}
+        }),
+        json!({
+            "name":"search_encyclopedia",
+            "description":"Search English Wikipedia for concise background facts with article links. Use for general knowledge, not breaking news or high-stakes advice. Search terms should identify the topic, person, place, or event.",
+            "inputSchema":{"type":"object","properties":{
+                "query":{"type":"string","minLength":2,"maxLength":120,"description":"Topic or factual question to search"}
+            },"required":["query"],"additionalProperties":false}
         }),
     ]
 }
@@ -76,8 +115,106 @@ pub async fn call(client: &Client, name: &str, arguments: &Value) -> Result<Valu
             };
             quote(client, kind).await
         }
+        "current_time" => {
+            if arguments
+                .as_object()
+                .is_none_or(|object| !object.is_empty())
+            {
+                return Err("Current time takes no arguments".into());
+            }
+            current_time()
+        }
+        "calculate" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Calculation arguments must be an object")?;
+            if object.keys().any(|key| key != "expression") {
+                return Err("Unknown calculation argument".into());
+            }
+            let expression = object
+                .get("expression")
+                .and_then(Value::as_str)
+                .ok_or("Missing expression")?;
+            let result = calculator::evaluate(expression)?;
+            Ok(json!({"expression":expression,"result":result}))
+        }
+        "roll_dice" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Dice arguments must be an object")?;
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "count" | "sides" | "modifier"))
+            {
+                return Err("Unknown dice argument".into());
+            }
+            let count = match object.get("count") {
+                Some(value) => value
+                    .as_u64()
+                    .filter(|n| (1..=20).contains(n))
+                    .ok_or("Dice count must be 1 through 20")?,
+                None => 1,
+            };
+            let sides = match object.get("sides") {
+                Some(value) => value
+                    .as_u64()
+                    .filter(|n| (2..=1000).contains(n))
+                    .ok_or("Dice sides must be 2 through 1000")?,
+                None => 6,
+            };
+            let modifier = match object.get("modifier") {
+                Some(value) => value
+                    .as_i64()
+                    .filter(|n| (-1000..=1000).contains(n))
+                    .ok_or("Dice modifier must be -1000 through 1000")?,
+                None => 0,
+            };
+            let mut rng = OsRng;
+            let rolls = (0..count)
+                .map(|_| rng.gen_range(1..=sides))
+                .collect::<Vec<_>>();
+            let total = rolls.iter().sum::<u64>() as i64 + modifier;
+            Ok(json!({"count":count,"sides":sides,"modifier":modifier,"rolls":rolls,"total":total}))
+        }
+        "define_word" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Definition arguments must be an object")?;
+            if object.keys().any(|key| key != "word") {
+                return Err("Unknown definition argument".into());
+            }
+            let word = object
+                .get("word")
+                .and_then(Value::as_str)
+                .ok_or("Missing word")?;
+            knowledge::define_word(client, word).await
+        }
+        "search_encyclopedia" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Encyclopedia arguments must be an object")?;
+            if object.keys().any(|key| key != "query") {
+                return Err("Unknown encyclopedia argument".into());
+            }
+            let query = object
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or("Missing query")?;
+            knowledge::search_encyclopedia(client, query).await
+        }
         _ => Err("Unknown skill tool".into()),
     }
+}
+
+fn current_time() -> Result<Value, String> {
+    let now = OffsetDateTime::now_utc();
+    let utc = now.format(&Rfc3339).map_err(|e| e.to_string())?;
+    let unix_seconds = now.unix_timestamp();
+    Ok(json!({
+        "utc":utc,
+        "unix_seconds":unix_seconds,
+        "discord_timestamp":format!("<t:{unix_seconds}:F>")
+    }))
 }
 
 async fn get_json(
@@ -543,5 +680,48 @@ mod tests {
             "Australia"
         );
         assert!(select_place(results.as_array().unwrap(), Some("Vietnam")).is_none());
+    }
+
+    #[tokio::test]
+    async fn utility_tools_return_structured_results_and_reject_bad_arguments() {
+        let client = Client::new();
+        let before = OffsetDateTime::now_utc().unix_timestamp();
+        let time = call(&client, "current_time", &json!({})).await.unwrap();
+        let after = OffsetDateTime::now_utc().unix_timestamp();
+        let timestamp = time["unix_seconds"].as_i64().unwrap();
+        assert!((before..=after).contains(&timestamp));
+        assert_eq!(time["discord_timestamp"], format!("<t:{timestamp}:F>"));
+        assert!(time["utc"].as_str().unwrap().ends_with('Z'));
+
+        let calculation = call(&client, "calculate", &json!({"expression":"(6 + 4) / 2"}))
+            .await
+            .unwrap();
+        assert_eq!(calculation["result"], 5.0);
+        assert!(call(&client, "calculate", &json!({"expression":"1 / 0"}))
+            .await
+            .is_err());
+
+        let dice = call(
+            &client,
+            "roll_dice",
+            &json!({"count":3,"sides":8,"modifier":-2}),
+        )
+        .await
+        .unwrap();
+        let rolls = dice["rolls"].as_array().unwrap();
+        assert_eq!(rolls.len(), 3);
+        assert!(rolls
+            .iter()
+            .all(|roll| (1..=8).contains(&roll.as_u64().unwrap())));
+        assert_eq!(
+            dice["total"].as_i64().unwrap(),
+            rolls.iter().map(|roll| roll.as_i64().unwrap()).sum::<i64>() - 2
+        );
+        assert!(call(&client, "roll_dice", &json!({"count":21}))
+            .await
+            .is_err());
+        assert!(call(&client, "current_time", &json!({"offset":7}))
+            .await
+            .is_err());
     }
 }

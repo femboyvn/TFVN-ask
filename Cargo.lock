@@ -571,11 +571,13 @@ name = "knowsphere"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "rand 0.8.7",
  "regex",
  "reqwest",
  "serde",
  "serde_json",
  "serenity",
+ "time",
  "tokio",
 ]
 

@@ -527,7 +527,19 @@ mod tests {
             .iter()
             .map(|tool| tool["function"]["name"].as_str().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["weather", "quote", "future_lookup"]);
+        assert_eq!(
+            names,
+            [
+                "weather",
+                "quote",
+                "current_time",
+                "calculate",
+                "roll_dice",
+                "define_word",
+                "search_encyclopedia",
+                "future_lookup"
+            ]
+        );
         assert_eq!(
             tools[0]["function"]["parameters"]["properties"]["day"]["type"],
             "string"
@@ -590,12 +602,31 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 10);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 15);
         assert!(tools["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .any(|tool| tool["name"] == "quote"));
+        let time = handle_rpc(
+            &mut server,
+            &skill_client,
+            &mut initialized,
+            &json!({"id":5,"method":"tools/call","params":{"name":"current_time","arguments":{}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(time["result"]["isError"], false);
+        assert!(time["result"]["structuredContent"]["unix_seconds"].is_i64());
+        let invalid_lookup = handle_rpc(
+            &mut server,
+            &skill_client,
+            &mut initialized,
+            &json!({"id":6,"method":"tools/call","params":{"name":"define_word","arguments":{"word":"bad/word"}}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(invalid_lookup["result"]["isError"], true);
         let bad_quote = handle_rpc(&mut server, &skill_client, &mut initialized, &json!({"id":4,"method":"tools/call","params":{"name":"quote","arguments":{"kind":"unknown"}}})).await.unwrap();
         assert_eq!(bad_quote["result"]["isError"], true);
         let update = handle_rpc(&mut server, &skill_client, &mut initialized, &json!({"id":3,"method":"tools/call","params":{"name":"memory_update","arguments":{"guild_id":1,"user_id":2,"changes":[{"field":"nickname","action":"set","value":"Momo"}]}}})).await.unwrap();
@@ -617,6 +648,131 @@ mod tests {
                 .unwrap()["enabled"],
             false
         );
+        let _ = std::fs::remove_file(conversation_path);
+        let _ = std::fs::remove_file(memory_path);
+    }
+
+    #[test]
+    fn memory_opt_out_clears_all_member_channels_and_survives_restart() {
+        let conversation_path = std::env::temp_dir().join(format!(
+            "knowsphere-mcp-{}-opt-out-history.json",
+            std::process::id()
+        ));
+        let memory_path = std::env::temp_dir().join(format!(
+            "knowsphere-mcp-{}-opt-out-memory.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&conversation_path);
+        let _ = std::fs::remove_file(&memory_path);
+
+        let mut server = MemoryServer::new(conversation_path.clone(), memory_path.clone());
+        let member = json!({"guild_id":1,"user_id":2});
+        server
+            .call(
+                "memory_update",
+                &json!({
+                    "guild_id":1,"user_id":2,
+                    "changes":[{"field":"nickname","action":"set","value":"Momo"}]
+                }),
+            )
+            .unwrap();
+        for channel in [10, 11] {
+            assert_eq!(
+                server
+                    .call(
+                        "conversation_append",
+                        &json!({
+                            "guild_id":1,"user_id":2,"channel_id":channel,
+                            "prompt":"hello","response":"hi"
+                        })
+                    )
+                    .unwrap()["saved"],
+                true
+            );
+        }
+        server
+            .call(
+                "conversation_append",
+                &json!({
+                    "guild_id":1,"user_id":3,"channel_id":10,
+                    "prompt":"other member","response":"still here"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(
+            server.call("memory_status", &member).unwrap()["preferences"]["nickname"],
+            "Momo"
+        );
+        for channel in [10, 11] {
+            assert_eq!(
+                server
+                    .call(
+                        "memory_context",
+                        &json!({
+                            "guild_id":1,"user_id":2,"channel_id":channel
+                        })
+                    )
+                    .unwrap()["history"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                2
+            );
+        }
+
+        assert_eq!(server.call("memory_off", &member).unwrap()["erased"], true);
+        assert_eq!(
+            server
+                .call(
+                    "conversation_append",
+                    &json!({
+                        "guild_id":1,"user_id":2,"channel_id":10,
+                        "prompt":"do not save","response":"ok"
+                    })
+                )
+                .unwrap()["saved"],
+            false
+        );
+        drop(server);
+
+        let mut reopened = MemoryServer::new(conversation_path.clone(), memory_path.clone());
+        for channel in [10, 11] {
+            let context = reopened
+                .call(
+                    "memory_context",
+                    &json!({
+                        "guild_id":1,"user_id":2,"channel_id":channel
+                    }),
+                )
+                .unwrap();
+            assert_eq!(context["enabled"], false);
+            assert_eq!(context["preferences"], json!({}));
+            assert_eq!(context["history"], json!([]));
+        }
+        let other = reopened
+            .call(
+                "memory_context",
+                &json!({
+                    "guild_id":1,"user_id":3,"channel_id":10
+                }),
+            )
+            .unwrap();
+        assert_eq!(other["history"][0]["content"], "other member");
+
+        reopened.call("memory_on", &member).unwrap();
+        let context = reopened
+            .call(
+                "memory_context",
+                &json!({
+                    "guild_id":1,"user_id":2,"channel_id":10
+                }),
+            )
+            .unwrap();
+        assert_eq!(context["enabled"], true);
+        assert_eq!(context["preferences"], json!({}));
+        assert_eq!(context["history"], json!([]));
+
         let _ = std::fs::remove_file(conversation_path);
         let _ = std::fs::remove_file(memory_path);
     }

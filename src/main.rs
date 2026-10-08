@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 use storage::{ChatMessage, Preferences};
 use tokio::sync::Mutex;
 
+type BotResult<T> = Result<T, Box<serenity::Error>>;
+
 const MAX_REFERENCE_DEPTH: usize = 8;
 const MAX_DISCORD_MESSAGE_LENGTH: usize = 1900;
 const MAX_REPORT_TRANSCRIPT_CHARS: usize = 16_000;
@@ -701,11 +703,7 @@ fn split_discord_message(text: &str) -> Vec<String> {
     chunks
 }
 
-async fn reply(
-    ctx: &Context,
-    message: &Message,
-    content: impl Into<String>,
-) -> serenity::Result<()> {
+async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> BotResult<()> {
     message
         .channel_id
         .send_message(
@@ -719,11 +717,7 @@ async fn reply(
     Ok(())
 }
 
-async fn send_plain(
-    ctx: &Context,
-    message: &Message,
-    content: impl Into<String>,
-) -> serenity::Result<()> {
+async fn send_plain(ctx: &Context, message: &Message, content: impl Into<String>) -> BotResult<()> {
     message
         .channel_id
         .send_message(
@@ -748,7 +742,7 @@ impl Handler {
         user_prompt: &str,
         include_reference_context: bool,
         remember: bool,
-    ) -> serenity::Result<()> {
+    ) -> BotResult<()> {
         let Some(guild) = message.guild_id else {
             return Ok(());
         };
@@ -877,7 +871,7 @@ impl Handler {
         message: &Message,
         arguments: &str,
         report: MessageReport,
-    ) -> serenity::Result<()> {
+    ) -> BotResult<()> {
         let Some(count) = parse_report_count(arguments, report.default_count()) else {
             return reply(ctx, message, "Please provide a number between 1 and 100.").await;
         };
@@ -958,7 +952,7 @@ impl Handler {
         Ok(())
     }
 
-    async fn help(&self, ctx: &Context, message: &Message) -> serenity::Result<()> {
+    async fn help(&self, ctx: &Context, message: &Message) -> BotResult<()> {
         let prefix = &self.state.config.command_prefix;
         let wake_line = if let Some(first) = self.state.config.wake_names.first() {
             format!("Wake names: {}. Start a message with one, like `{first}, what's the weather in Da Nang?`", self.state.config.wake_names.join(", "))
@@ -973,7 +967,7 @@ impl Handler {
         ctx: &Context,
         message: &Message,
         remainder: &str,
-    ) -> serenity::Result<()> {
+    ) -> BotResult<()> {
         let (command, arguments) = remainder
             .split_once(char::is_whitespace)
             .unwrap_or((remainder, ""));
@@ -1023,7 +1017,7 @@ impl Handler {
         }
     }
 
-    async fn handle_message(&self, ctx: &Context, message: &Message) -> serenity::Result<()> {
+    async fn handle_message(&self, ctx: &Context, message: &Message) -> BotResult<()> {
         if message.author.bot || message.guild_id.is_none() {
             return Ok(());
         }

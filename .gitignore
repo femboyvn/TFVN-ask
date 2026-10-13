@@ -1,5 +1,6 @@
 .env
 .knownsphere_conversations.json
 .knownsphere_memories.json
+.knownsphere_forum_state.json
 *.json.tmp
 target/

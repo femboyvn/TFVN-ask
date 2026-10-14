@@ -1355,7 +1355,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut runtime = ForumRuntime::load_or_create(forum_id)?;
         runtime
-            .init_model_tags(&discord_http, channel, &config.forum_models)
+            .init_model_tags(
+                &discord_http,
+                channel,
+                &config.forum_models,
+                &config.openai_model,
+            )
             .await?;
         Some(runtime)
     } else {

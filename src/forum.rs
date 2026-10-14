@@ -21,13 +21,14 @@ pub fn parse_model_tags(
     default_model: &str,
     extra_models: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let mut models = vec![default_model.to_owned()];
+    let mut models = Vec::new();
     if let Some(extra_models) = extra_models
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
         models.extend(extra_models.split(',').map(|model| model.trim().to_owned()));
     }
+    models.push(default_model.to_owned());
     for model in &models {
         if model.is_empty() || model.chars().count() > MAX_TAG_NAME_CHARS {
             return Err(format!(
@@ -37,6 +38,11 @@ pub fn parse_model_tags(
     }
     let mut unique = Vec::new();
     for model in models {
+        let model = if model.eq_ignore_ascii_case(default_model) {
+            default_model.to_owned()
+        } else {
+            model
+        };
         if !unique
             .iter()
             .any(|item: &String| item.eq_ignore_ascii_case(&model))
@@ -158,6 +164,7 @@ pub struct ForumRuntime {
     state: Mutex<ForumState>,
     path: PathBuf,
     model_tags: HashMap<ForumTagId, String>,
+    model_order: Vec<ForumTagId>,
     default_model_tag: Option<ForumTagId>,
 }
 
@@ -179,6 +186,7 @@ impl ForumRuntime {
             state: Mutex::new(state),
             path,
             model_tags: HashMap::new(),
+            model_order: Vec::new(),
             default_model_tag: None,
         })
     }
@@ -188,6 +196,7 @@ impl ForumRuntime {
         http: &Http,
         forum: GuildChannel,
         models: &[String],
+        default_model: &str,
     ) -> Result<(), String> {
         if models.is_empty() {
             return Err("At least one forum model is required".into());
@@ -200,6 +209,7 @@ impl ForumRuntime {
             None => forum,
         };
         self.model_tags.clear();
+        self.model_order.clear();
         for model in models {
             let tag = updated
                 .available_tags
@@ -207,12 +217,18 @@ impl ForumRuntime {
                 .find(|tag| tag.name.eq_ignore_ascii_case(model))
                 .ok_or_else(|| format!("Discord did not return the forum tag for {model}"))?;
             self.model_tags.insert(tag.id, model.clone());
+            self.model_order.push(tag.id);
         }
         self.default_model_tag = updated
             .available_tags
             .iter()
-            .find(|tag| tag.name.eq_ignore_ascii_case(&models[0]))
+            .find(|tag| tag.name.eq_ignore_ascii_case(default_model))
             .map(|tag| tag.id);
+        if self.default_model_tag.is_none() {
+            return Err(format!(
+                "Discord did not return the default model tag for {default_model}"
+            ));
+        }
         Ok(())
     }
 
@@ -220,14 +236,12 @@ impl ForumRuntime {
         &self,
         thread: &GuildChannel,
     ) -> Result<(&str, Option<ForumTagId>), String> {
-        let mut selected = thread
-            .applied_tags
+        if let Some(model) = self
+            .model_order
             .iter()
-            .filter_map(|id| self.model_tags.get(id));
-        if let Some(model) = selected.next() {
-            if selected.next().is_some() {
-                return Err("Choose only one model tag for this post.".into());
-            }
+            .find(|id| thread.applied_tags.contains(id))
+            .and_then(|id| self.model_tags.get(id))
+        {
             return Ok((model, None));
         }
         let default_tag = self
@@ -439,10 +453,14 @@ mod tests {
     }
 
     #[test]
-    fn model_tags_validate_names_and_keep_default_first() {
+    fn model_tags_validate_names_and_keep_environment_order() {
         assert_eq!(
             parse_model_tags("gpt-6-ultra", Some(" claude-opus-5.5, GPT-6-ULTRA ")).unwrap(),
-            ["gpt-6-ultra", "claude-opus-5.5"]
+            ["claude-opus-5.5", "gpt-6-ultra"]
+        );
+        assert_eq!(
+            parse_model_tags("gpt-6-ultra", Some("claude-opus-5.5,other")).unwrap(),
+            ["claude-opus-5.5", "other", "gpt-6-ultra"]
         );
         assert!(
             parse_model_tags("gpt-6-ultra", Some("model-name-over-twenty-characters")).is_err()
@@ -475,7 +493,7 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_uses_one_tag_or_the_default() {
+    fn model_selection_follows_environment_order_not_applied_tag_order() {
         let default_tag = ForumTagId::new(1);
         let other_tag = ForumTagId::new(2);
         let runtime = ForumRuntime {
@@ -491,6 +509,7 @@ mod tests {
                 (default_tag, "gpt-6-ultra".into()),
                 (other_tag, "claude-opus-5.5".into()),
             ]),
+            model_order: vec![other_tag, default_tag],
             default_model_tag: Some(default_tag),
         };
         let mut thread = GuildChannel::default();
@@ -503,8 +522,11 @@ mod tests {
             runtime.selected_model(&thread).unwrap(),
             ("claude-opus-5.5", None)
         );
-        thread.applied_tags.push(default_tag);
-        assert!(runtime.selected_model(&thread).is_err());
+        thread.applied_tags = vec![default_tag, other_tag];
+        assert_eq!(
+            runtime.selected_model(&thread).unwrap(),
+            ("claude-opus-5.5", None)
+        );
     }
 
     #[test]

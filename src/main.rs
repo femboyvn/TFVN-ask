@@ -113,6 +113,12 @@ struct MemoryAction {
     skip_history: bool,
 }
 
+struct ChatScope {
+    guild: u64,
+    user: u64,
+    channel: u64,
+}
+
 struct Config {
     discord_token: String,
     openai_api_key: String,
@@ -284,9 +290,7 @@ impl State {
     async fn generate_chat_response(
         &self,
         prompt: &str,
-        guild: u64,
-        user: u64,
-        channel: u64,
+        scope: ChatScope,
         action: &MemoryAction,
         history_override: Option<&[ChatMessage]>,
         model: Option<&str>,
@@ -294,7 +298,13 @@ impl State {
         let mut messages = vec![ChatMessage::new("system", SYSTEM_PROMPT)];
         let context: MemoryContext = serde_json::from_value(
             self.memory_mcp
-                .call("memory_context", json!({}), guild, user, Some(channel))
+                .call(
+                    "memory_context",
+                    json!({}),
+                    scope.guild,
+                    scope.user,
+                    Some(scope.channel),
+                )
                 .await?,
         )
         .map_err(|e| format!("Invalid memory MCP context: {e}"))?;
@@ -913,9 +923,11 @@ impl Handler {
             .state
             .generate_chat_response(
                 &format!("{}: {user_prompt}", display_name(message)),
-                guild.get(),
-                message.author.id.get(),
-                message.channel_id.get(),
+                ChatScope {
+                    guild: guild.get(),
+                    user: message.author.id.get(),
+                    channel: message.channel_id.get(),
+                },
                 &action,
                 Some(&history),
                 Some(model),
@@ -1019,9 +1031,11 @@ impl Handler {
             .state
             .generate_chat_response(
                 &full_prompt,
-                guild.get(),
-                message.author.id.get(),
-                message.channel_id.get(),
+                ChatScope {
+                    guild: guild.get(),
+                    user: message.author.id.get(),
+                    channel: message.channel_id.get(),
+                },
                 &action,
                 None,
                 None,

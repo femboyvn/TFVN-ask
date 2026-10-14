@@ -480,7 +480,7 @@ mod tests {
         }))
         .unwrap();
         let models = vec!["gpt-6-ultra".to_owned(), "claude-opus-5.5".to_owned()];
-        let payload = model_tag_payload(&[existing.clone()], &models)
+        let payload = model_tag_payload(std::slice::from_ref(&existing), &models)
             .unwrap()
             .unwrap();
         let tags = payload["available_tags"].as_array().unwrap();

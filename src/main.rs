@@ -121,6 +121,7 @@ struct Config {
     command_prefix: String,
     wake_names: Vec<String>,
     forum_channel: Option<ChannelId>,
+    forum_models: Vec<String>,
 }
 
 impl Config {
@@ -155,6 +156,13 @@ impl Config {
         } else {
             format!("{base}/chat/completions")
         };
+        let forum_channel =
+            forum::parse_channel_id(env::var("FORUM_TYPE_CHANNEL").ok().as_deref())?;
+        let forum_models = if forum_channel.is_some() {
+            forum::parse_model_tags(&openai_model, env::var("FORUM_MODELS").ok().as_deref())?
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             discord_token,
             openai_api_key,
@@ -167,7 +175,8 @@ impl Config {
             wake_names: parse_wake_names(
                 &env::var("WAKE_NAMES").unwrap_or_else(|_| "KnownSphere,TransGPT".into()),
             )?,
-            forum_channel: forum::parse_channel_id(env::var("FORUM_TYPE_CHANNEL").ok().as_deref())?,
+            forum_channel,
+            forum_models,
         })
     }
 }
@@ -217,7 +226,7 @@ impl State {
             .iter()
             .map(|message| serde_json::to_value(message).map_err(|e| e.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.call_openai_payload_raw(&messages, tools, read_timeout)
+        self.call_openai_payload_raw(&messages, tools, read_timeout, None)
             .await
     }
 
@@ -226,8 +235,10 @@ impl State {
         messages: &[Value],
         tools: Option<&[Value]>,
         read_timeout: u64,
+        model: Option<&str>,
     ) -> Result<Value, String> {
-        let mut body = json!({"model": self.config.openai_model, "messages": messages});
+        let mut body =
+            json!({"model": model.unwrap_or(&self.config.openai_model), "messages": messages});
         if let Some(tools) = tools {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
@@ -278,6 +289,7 @@ impl State {
         channel: u64,
         action: &MemoryAction,
         history_override: Option<&[ChatMessage]>,
+        model: Option<&str>,
     ) -> Result<String, String> {
         let mut messages = vec![ChatMessage::new("system", SYSTEM_PROMPT)];
         let context: MemoryContext = serde_json::from_value(
@@ -317,7 +329,7 @@ impl State {
         let mut used_weather = false;
         for _ in 0..4 {
             let payload = self
-                .call_openai_payload_raw(&messages, Some(self.memory_mcp.chat_tools()), 90)
+                .call_openai_payload_raw(&messages, Some(self.memory_mcp.chat_tools()), 90, model)
                 .await?;
             let assistant = payload
                 .get("choices")
@@ -846,6 +858,38 @@ impl Handler {
             )
             .await;
         }
+        let mut thread = match message.channel_id.to_channel(&ctx.http).await? {
+            Channel::Guild(thread) => thread,
+            _ => return Ok(()),
+        };
+        let (model, default_tag) = match forum.selected_model(&thread) {
+            Ok(selection) => selection,
+            Err(error) => {
+                return reply(ctx, message, format!("I couldn't reply just now: {error}")).await
+            }
+        };
+        if let Some(default_tag) = default_tag {
+            if thread.applied_tags.len() >= 5 {
+                return reply(ctx, message, "I couldn't reply just now: This post has five tags. Remove one so I can add the model tag.").await;
+            }
+            let mut tags = thread.applied_tags.clone();
+            tags.push(default_tag);
+            if let Err(error) = thread
+                .edit_thread(&ctx.http, EditThread::new().applied_tags(tags))
+                .await
+            {
+                eprintln!(
+                    "Could not apply default model tag to forum post {}: {error}",
+                    message.channel_id
+                );
+                return reply(
+                    ctx,
+                    message,
+                    "I couldn't reply just now: I could not apply the model tag to this post.",
+                )
+                .await;
+            }
+        }
         let starter_view = ForumMessage::from(&starter);
         let history = forum::build_context(message.id.get(), &starter_view, &recent, bot_id);
         let action = match self
@@ -874,6 +918,7 @@ impl Handler {
                 message.channel_id.get(),
                 &action,
                 Some(&history),
+                Some(model),
             )
             .await;
         typing.stop();
@@ -978,6 +1023,7 @@ impl Handler {
                 message.author.id.get(),
                 message.channel_id.get(),
                 &action,
+                None,
                 None,
             )
             .await;
@@ -1297,12 +1343,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let forum = if let Some(forum_id) = config.forum_channel {
         let discord_http = serenity::http::Http::new(&token);
         let channel = forum_id.to_channel(&discord_http).await?;
-        if !matches!(channel, Channel::Guild(ref channel) if channel.kind == ChannelType::Forum) {
+        let Channel::Guild(channel) = channel else {
+            return Err(
+                "FORUM_TYPE_CHANNEL must identify an accessible Discord forum channel".into(),
+            );
+        };
+        if channel.kind != ChannelType::Forum {
             return Err(
                 "FORUM_TYPE_CHANNEL must identify an accessible Discord forum channel".into(),
             );
         }
-        Some(ForumRuntime::load_or_create(forum_id)?)
+        let mut runtime = ForumRuntime::load_or_create(forum_id)?;
+        runtime
+            .init_model_tags(&discord_http, channel, &config.forum_models)
+            .await?;
+        Some(runtime)
     } else {
         None
     };

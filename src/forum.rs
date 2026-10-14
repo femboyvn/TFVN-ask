@@ -1,7 +1,9 @@
 use crate::storage::ChatMessage;
 use serde::{Deserialize, Serialize};
-use serenity::all::{ChannelId, ChannelType, GuildChannel, Message};
-use std::collections::BTreeSet;
+use serde_json::{json, Value};
+use serenity::all::{ChannelId, ChannelType, ForumTag, ForumTagId, GuildChannel, Message};
+use serenity::http::Http;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,70 @@ const DISCORD_EPOCH_MS: u64 = 1_420_070_400_000;
 const MAX_CONTEXT_MESSAGES: usize = 20;
 const MAX_CONTEXT_CHARS: usize = 16_000;
 const STATE_PATH: &str = ".knownsphere_forum_state.json";
+const MAX_FORUM_TAGS: usize = 20;
+const MAX_TAG_NAME_CHARS: usize = 20;
+
+pub fn parse_model_tags(
+    default_model: &str,
+    extra_models: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut models = vec![default_model.to_owned()];
+    if let Some(extra_models) = extra_models
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        models.extend(extra_models.split(',').map(|model| model.trim().to_owned()));
+    }
+    for model in &models {
+        if model.is_empty() || model.chars().count() > MAX_TAG_NAME_CHARS {
+            return Err(format!(
+                "Forum model names must contain 1 to {MAX_TAG_NAME_CHARS} characters: {model:?}"
+            ));
+        }
+    }
+    let mut unique = Vec::new();
+    for model in models {
+        if !unique
+            .iter()
+            .any(|item: &String| item.eq_ignore_ascii_case(&model))
+        {
+            unique.push(model);
+        }
+    }
+    if unique.len() > MAX_FORUM_TAGS {
+        return Err(format!(
+            "A Discord forum supports at most {MAX_FORUM_TAGS} model tags"
+        ));
+    }
+    Ok(unique)
+}
+
+fn model_tag_payload(existing: &[ForumTag], models: &[String]) -> Result<Option<Value>, String> {
+    let missing = models
+        .iter()
+        .filter(|model| {
+            !existing
+                .iter()
+                .any(|tag| tag.name.eq_ignore_ascii_case(model))
+        })
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    if existing.len() + missing.len() > MAX_FORUM_TAGS {
+        return Err(format!(
+            "The forum has {} tags and needs {} more model tags, exceeding Discord's limit of {MAX_FORUM_TAGS}",
+            existing.len(), missing.len()
+        ));
+    }
+    // Include existing IDs, moderation settings, and emoji so Discord keeps those tags intact.
+    let mut tags = existing
+        .iter()
+        .map(|tag| serde_json::to_value(tag).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    tags.extend(missing.into_iter().map(|model| json!({"name": model})));
+    Ok(Some(json!({"available_tags": tags})))
+}
 
 pub fn parse_channel_id(value: Option<&str>) -> Result<Option<ChannelId>, String> {
     let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -91,6 +157,8 @@ pub struct ForumRuntime {
     pub activated_at_ms: u64,
     state: Mutex<ForumState>,
     path: PathBuf,
+    model_tags: HashMap<ForumTagId, String>,
+    default_model_tag: Option<ForumTagId>,
 }
 
 impl ForumRuntime {
@@ -110,7 +178,66 @@ impl ForumRuntime {
             activated_at_ms: state.activated_at_ms,
             state: Mutex::new(state),
             path,
+            model_tags: HashMap::new(),
+            default_model_tag: None,
         })
+    }
+
+    pub async fn init_model_tags(
+        &mut self,
+        http: &Http,
+        forum: GuildChannel,
+        models: &[String],
+    ) -> Result<(), String> {
+        if models.is_empty() {
+            return Err("At least one forum model is required".into());
+        }
+        let updated = match model_tag_payload(&forum.available_tags, models)? {
+            Some(payload) => http
+                .edit_channel(self.forum_id, &payload, None)
+                .await
+                .map_err(|error| format!("Could not initialize forum model tags: {error}"))?,
+            None => forum,
+        };
+        self.model_tags.clear();
+        for model in models {
+            let tag = updated
+                .available_tags
+                .iter()
+                .find(|tag| tag.name.eq_ignore_ascii_case(model))
+                .ok_or_else(|| format!("Discord did not return the forum tag for {model}"))?;
+            self.model_tags.insert(tag.id, model.clone());
+        }
+        self.default_model_tag = updated
+            .available_tags
+            .iter()
+            .find(|tag| tag.name.eq_ignore_ascii_case(&models[0]))
+            .map(|tag| tag.id);
+        Ok(())
+    }
+
+    pub fn selected_model(
+        &self,
+        thread: &GuildChannel,
+    ) -> Result<(&str, Option<ForumTagId>), String> {
+        let mut selected = thread
+            .applied_tags
+            .iter()
+            .filter_map(|id| self.model_tags.get(id));
+        if let Some(model) = selected.next() {
+            if selected.next().is_some() {
+                return Err("Choose only one model tag for this post.".into());
+            }
+            return Ok((model, None));
+        }
+        let default_tag = self
+            .default_model_tag
+            .ok_or("Forum model tags are not initialized")?;
+        let model = self
+            .model_tags
+            .get(&default_tag)
+            .ok_or("Default forum model tag is missing")?;
+        Ok((model, Some(default_tag)))
     }
 
     pub async fn is_titled(&self, thread_id: ChannelId) -> bool {
@@ -309,6 +436,75 @@ mod tests {
         assert_eq!(parse_channel_id(Some("123")).unwrap().unwrap().get(), 123);
         assert!(parse_channel_id(Some("bad")).is_err());
         assert!(parse_channel_id(Some("0")).is_err());
+    }
+
+    #[test]
+    fn model_tags_validate_names_and_keep_default_first() {
+        assert_eq!(
+            parse_model_tags("gpt-6-ultra", Some(" claude-opus-5.5, GPT-6-ULTRA ")).unwrap(),
+            ["gpt-6-ultra", "claude-opus-5.5"]
+        );
+        assert!(
+            parse_model_tags("gpt-6-ultra", Some("model-name-over-twenty-characters")).is_err()
+        );
+        assert!(parse_model_tags("gpt-6-ultra", Some("model,,other")).is_err());
+        assert_eq!(
+            parse_model_tags("gpt-6-ultra", Some(" ")).unwrap(),
+            ["gpt-6-ultra"]
+        );
+    }
+
+    #[test]
+    fn adding_model_tags_preserves_existing_ids_and_settings() {
+        let existing: ForumTag = serde_json::from_value(json!({
+            "id": "123", "name": "Community", "moderated": true,
+            "emoji_id": null, "emoji_name": "🐱"
+        }))
+        .unwrap();
+        let models = vec!["gpt-6-ultra".to_owned(), "claude-opus-5.5".to_owned()];
+        let payload = model_tag_payload(&[existing.clone()], &models)
+            .unwrap()
+            .unwrap();
+        let tags = payload["available_tags"].as_array().unwrap();
+        assert_eq!(tags.len(), 3);
+        assert_eq!(tags[0], serde_json::to_value(&existing).unwrap());
+        assert_eq!(tags[1]["name"], "gpt-6-ultra");
+        assert!(model_tag_payload(&[existing], &["community".into()])
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn model_selection_uses_one_tag_or_the_default() {
+        let default_tag = ForumTagId::new(1);
+        let other_tag = ForumTagId::new(2);
+        let runtime = ForumRuntime {
+            forum_id: ChannelId::new(10),
+            activated_at_ms: 1,
+            state: Mutex::new(ForumState {
+                forum_id: 10,
+                activated_at_ms: 1,
+                titled_threads: BTreeSet::new(),
+            }),
+            path: PathBuf::new(),
+            model_tags: HashMap::from([
+                (default_tag, "gpt-6-ultra".into()),
+                (other_tag, "claude-opus-5.5".into()),
+            ]),
+            default_model_tag: Some(default_tag),
+        };
+        let mut thread = GuildChannel::default();
+        assert_eq!(
+            runtime.selected_model(&thread).unwrap(),
+            ("gpt-6-ultra", Some(default_tag))
+        );
+        thread.applied_tags = vec![other_tag];
+        assert_eq!(
+            runtime.selected_model(&thread).unwrap(),
+            ("claude-opus-5.5", None)
+        );
+        thread.applied_tags.push(default_tag);
+        assert!(runtime.selected_model(&thread).is_err());
     }
 
     #[test]

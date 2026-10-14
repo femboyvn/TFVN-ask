@@ -4,10 +4,14 @@ Set `FORUM_TYPE_CHANNEL` in `.env` to the numeric ID of a Discord **Forum** chan
 
 ```dotenv
 FORUM_TYPE_CHANNEL=123456789012345678
+OPENAI_MODEL=gpt-6-ultra
+FORUM_MODELS=claude-opus-5.5
 ```
 
-The setting is optional. When it is absent, the bot keeps its existing command, mention, wake-name, and reply behavior. When present, the bot checks that it can access the channel and that it is a Forum channel before starting. Give the bot **View Channel**, **Read Message History**, **Send Messages in Threads**, and **Manage Threads** permissions for the forum. Enable the **Message Content** privileged intent in the Discord developer portal; the bot already requests this gateway intent.
+`FORUM_TYPE_CHANNEL` is optional. When it is absent, the bot keeps its existing command, mention, wake-name, and reply behavior. When present, the bot checks that it can access the channel and that it is a Forum channel before starting. The bot adds one tag for `OPENAI_MODEL` and one for each comma-separated model ID in `FORUM_MODELS`. The example model IDs are placeholders; configure only IDs supported by your `OPENAI_API_BASE_URL` and `OPENAI_API_KEY`. All forum models use that same endpoint and key. `FORUM_MODELS` may be omitted for a single-model forum.
 
-Members start a chat by making a new forum post with any title and a text question in its body. The bot comments with an answer and then replaces the post title with a short summary. Any member can continue by sending a plain text comment in that post. Existing posts in the forum are not enrolled; the bot records the first activation time in `.knownsphere_forum_state.json`, so eligible posts continue working after restarts. Changing `FORUM_TYPE_CHANNEL` starts a new activation time for the newly configured forum.
+On startup, the bot preserves existing forum tags and their IDs and adds missing model tags. Discord allows at most 20 forum tags, with names of at most 20 characters. Give the bot **View Channel**, **Read Message History**, **Send Messages in Threads**, **Manage Threads**, and **Manage Channels** permissions for the forum. Enable the **Message Content** privileged intent in the Discord developer portal; the bot already requests this gateway intent.
+
+Members start a chat by making a new forum post with any title and a text question in its body. They can select one model tag to choose the model for that post. If they select none, the bot adds the `OPENAI_MODEL` tag and uses that model. A post with multiple model tags must be changed to one model tag before the bot answers. The bot comments with an answer and then replaces the post title with a short summary. Any member can continue by sending a plain text comment in that post. Changing the model tag changes the model for subsequent answers. Existing posts in the forum are not enrolled; the bot records the first activation time in `.knownsphere_forum_state.json`, so eligible posts continue working after restarts. Changing `FORUM_TYPE_CHANNEL` starts a new activation time for the newly configured forum.
 
 The bot reads recent visible messages from each post for context. Edits and deletions in Discord affect later answers. Existing chat behavior outside eligible forum posts continues as before. To start a fresh forum conversation, create another post.

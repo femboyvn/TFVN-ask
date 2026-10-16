@@ -1,0 +1,12 @@
+services:
+  knowsphere:
+    build: .
+    image: knowsphere
+    env_file:
+      - .env
+    volumes:
+      - knowsphere-data:/data
+    restart: unless-stopped
+
+volumes:
+  knowsphere-data:

@@ -122,7 +122,7 @@ The bot keeps these in a child process of the same binary (`knowsphere --memory-
 
 ## Forum channel
 
-Set `FORUM_TYPE_CHANNEL` to a forum's numeric id. On startup the bot checks that the channel exists and is a forum, then adds one tag per model. Members open a post, pick a model tag, and continue in the thread. Posts created before the first successful start stay inactive. Changing the forum id starts a new activation time.
+Set `FORUM_TYPE_CHANNEL` to a forum's numeric id. On startup the bot checks that the channel exists and is a forum, then adds one tag per model. Members open a post, pick a model tag, and continue in the thread. A post or reply can include text, images, and files. Posts created before the first successful start stay inactive. Changing the forum id starts a new activation time.
 
 Prefix commands do not run inside an enrolled forum thread. Elsewhere, chat works as before.
 

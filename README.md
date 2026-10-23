@@ -10,20 +10,24 @@ The bot responds in guild channels. It ignores direct messages and messages from
 
 Create an application and a bot in the Discord developer portal. Invite the bot to your server with the `bot` scope.
 
-Enable the **Message Content** privileged intent. The process requests the `GUILDS`, `GUILD_MESSAGES`, and `MESSAGE_CONTENT` gateway intents.
+Enable the **Message Content** privileged intent. The process requests the `GUILDS`, `GUILD_MESSAGES`, `MESSAGE_CONTENT`, and `GUILD_MESSAGE_REACTIONS` gateway intents.
 
-For ordinary channels, allow **View Channel**, **Send Messages**, and **Read Message History**. Forum mode also needs **Send Messages in Threads**, **Manage Threads**, and **Manage Channels** on that forum. Details are in [docs/forum-chat.md](docs/forum-chat.md).
+For ordinary channels, allow **View Channel**, **Send Messages**, **Read Message History**, and **Add Reactions**. Forum mode also needs **Send Messages in Threads**, **Manage Threads**, and **Manage Channels** on that forum. Details are in [docs/forum-chat.md](docs/forum-chat.md).
 
 ## Configure
 
-Copy the variables below into `.env` in the working directory, or export them in the environment. The process loads `.env` when that file exists. `.env` is gitignored.
+Copy `.env.example` to `.env` in the working directory and replace the placeholder secrets, or export the variables below. The process loads `.env` when that file exists. `.env` and `endpoints.json` are gitignored.
+
+`.env.example` sets `ENDPOINTS_CONFIG` to `endpoints.example.json`. That file lists two endpoints. Each one names an environment variable (`OPENAI_API_KEY`, `BACKUP_API_KEY`) instead of storing a key. `OPENAI_MODEL` must be one of the listed models and becomes the default.
 
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `DISCORD_TOKEN` | yes | | Bot token |
-| `OPENAI_API_KEY` | yes | | Bearer token for the chat API |
-| `OPENAI_MODEL` | no | `gpt-4o-mini` | Model id sent on each completion |
-| `OPENAI_API_BASE_URL` | no | `https://api.openai.com/v1` | API origin. `OPENAI_BASE_URL` is used when this is unset |
+| `ENDPOINTS_CONFIG` | no | `endpoints.json` if that file exists | Endpoint list. When unset and that file is absent, one endpoint is built from the `OPENAI_*` variables |
+| `OPENAI_API_KEY` | yes, unless the endpoint file supplies keys | | Bearer token for the chat API. Also the key for the `openai` entry in `endpoints.example.json` |
+| `BACKUP_API_KEY` | no | | Key for the `backup` entry in `endpoints.example.json` |
+| `OPENAI_MODEL` | no | `gpt-4o-mini` | Default model. With an endpoint file, it must be listed there |
+| `OPENAI_API_BASE_URL` | no | `https://api.openai.com/v1` | API origin for the single env endpoint. `OPENAI_BASE_URL` is used when this is unset |
 | `COMMAND_PREFIX` | no | `!knowsphere` | Command prefix |
 | `WAKE_NAMES` | no | `KnownSphere,TransGPT` | Up to 12 comma-separated names |
 | `FORUM_TYPE_CHANNEL` | no | | Forum channel id. Omit to disable forum mode |
@@ -31,7 +35,7 @@ Copy the variables below into `.env` in the working directory, or export them in
 | `CONVERSATION_STORE_PATH` | no | `.knownsphere_conversations.json` | Channel history file, read by the memory process |
 | `MEMORY_STORE_PATH` | no | `.knownsphere_memories.json` | Preference file, read by the memory process |
 
-A base URL that already ends in `/chat/completions` is used unchanged. Any other base receives that suffix. Every configured model uses the same base URL and API key. Forum tag names are limited to 20 characters.
+A base URL that already ends in `/chat/completions` is used unchanged. Any other base receives that suffix. Without an endpoint file, every model shares `OPENAI_API_BASE_URL` and `OPENAI_API_KEY`. With an endpoint file, each entry has its own base URL and key. Forum tag names are limited to 20 characters.
 
 Wake names are 2–32 characters: letters, numbers, spaces, hyphens, or underscores.
 
@@ -76,7 +80,7 @@ These also start a chat:
 - A reply to one of the bot's messages.
 - A message that starts with a wake name, optionally after `hey`, `hi`, `hello`, `yo`, `ê`, `này`, or `alo`. Matching ignores case. `TransGPT, what should I wear?` works. `I called TransGPT yesterday` does not.
 
-Each member can send a request every 8 seconds. Long answers are split into messages of at most 1900 characters. The bot replies without pinging the member.
+Each member can send a request every 8 seconds. Long answers are split into messages of at most 1900 characters. The bot replies without pinging the member. The first part of an answer has a 🔄 reaction. The member who asked can add that reaction once. The next try is the 🔄 on the new answer.
 
 `summarize`, `actions`, and `decisions` read earlier messages in the channel. They cite Discord message links and skip bot messages.
 

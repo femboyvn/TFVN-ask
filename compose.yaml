@@ -6,6 +6,7 @@ services:
       - .env
     volumes:
       - knowsphere-data:/data
+      - ./endpoints.json:/data/endpoints.json:ro
     restart: unless-stopped
 
 volumes:

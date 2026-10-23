@@ -1,4 +1,5 @@
 mod calculator;
+mod endpoints;
 mod forum;
 mod knowledge;
 mod mcp;
@@ -12,13 +13,14 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use serenity::all::{
-    Channel, ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Message, Ready,
+    Channel, ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Message,
+    MessageReaction, Reaction, ReactionType, Ready,
 };
 use serenity::builder::{CreateAllowedMentions, CreateMessage, EditThread, GetMessages};
 use serenity::Client;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use storage::{ChatMessage, Preferences};
@@ -31,6 +33,7 @@ const MAX_DISCORD_MESSAGE_LENGTH: usize = 1900;
 const MAX_REPORT_TRANSCRIPT_CHARS: usize = 16_000;
 const MAX_REPORT_MESSAGE_CHARS: usize = 600;
 const COOLDOWN_SECONDS: u64 = 8;
+const RETRY_EMOJI: &str = "🔄";
 const SYSTEM_PROMPT: &str = r#"You are KnownSphere, a friendly companion in a femboy-friendly Discord server.
 Be welcoming to everyone. Never assume a person's gender, identity, pronouns, or interests.
 Your usual voice is very uwu: playful wording, affectionate warmth, and frequent kaomoji.
@@ -123,59 +126,44 @@ struct ChatScope {
 
 struct Config {
     discord_token: String,
-    openai_api_key: String,
-    openai_model: String,
-    chat_endpoint: String,
+    endpoints: endpoints::EndpointSet,
     command_prefix: String,
     wake_names: Vec<String>,
     forum_channel: Option<ChannelId>,
     forum_models: Vec<String>,
 }
 
+struct GeneratedReply {
+    text: String,
+    label: String,
+}
+
 impl Config {
     fn load() -> Result<Self, String> {
         let _ = dotenvy::dotenv();
         let discord_token = env::var("DISCORD_TOKEN").unwrap_or_default();
-        let openai_api_key = env::var("OPENAI_API_KEY")
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        let openai_model = env::var("OPENAI_MODEL")
-            .unwrap_or_else(|_| "gpt-4o-mini".into())
-            .trim()
-            .to_owned();
         if discord_token.is_empty() {
             return Err("Missing DISCORD_TOKEN in the environment.".into());
         }
-        if openai_api_key.is_empty() {
-            return Err("Missing OPENAI_API_KEY in the environment.".into());
-        }
-        if openai_model.is_empty() {
-            return Err("Missing OPENAI_MODEL in the environment.".into());
-        }
-        let base = env::var("OPENAI_API_BASE_URL")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| env::var("OPENAI_BASE_URL").ok().filter(|s| !s.is_empty()))
-            .unwrap_or_else(|| "https://api.openai.com/v1".into());
-        let base = base.trim().trim_end_matches('/');
-        let chat_endpoint = if base.ends_with("/chat/completions") {
-            base.to_owned()
-        } else {
-            format!("{base}/chat/completions")
-        };
         let forum_channel =
             forum::parse_channel_id(env::var("FORUM_TYPE_CHANNEL").ok().as_deref())?;
+        let extra_models = if forum_channel.is_some() {
+            env::var("FORUM_MODELS").ok()
+        } else {
+            None
+        };
+        let endpoints = endpoints::EndpointSet::load(extra_models.as_deref())?;
         let forum_models = if forum_channel.is_some() {
-            forum::parse_model_tags(&openai_model, env::var("FORUM_MODELS").ok().as_deref())?
+            let models =
+                forum::parse_model_tags(endpoints.default_model(), extra_models.as_deref())?;
+            endpoints.ensure_known_models(&models)?;
+            models
         } else {
             Vec::new()
         };
         Ok(Self {
             discord_token,
-            openai_api_key,
-            openai_model,
-            chat_endpoint,
+            endpoints,
             command_prefix: env::var("COMMAND_PREFIX")
                 .unwrap_or_else(|_| "!knowsphere".into())
                 .trim()
@@ -198,6 +186,7 @@ struct State {
     bot_id: AtomicU64,
     forum: Option<ForumRuntime>,
     forum_channel_cache: Mutex<HashMap<ChannelId, bool>>,
+    spent_retries: Mutex<HashSet<u64>>,
 }
 
 impl State {
@@ -224,37 +213,27 @@ impl State {
         0
     }
 
-    async fn call_openai_payload(
-        &self,
-        messages: &[ChatMessage],
-        tools: Option<&[Value]>,
-        read_timeout: u64,
-    ) -> Result<Value, String> {
-        let messages = messages
-            .iter()
-            .map(|message| serde_json::to_value(message).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.call_openai_payload_raw(&messages, tools, read_timeout, None)
-            .await
+    fn attempts_for(&self, model: Option<&str>) -> Vec<endpoints::Attempt> {
+        let model = model.unwrap_or_else(|| self.config.endpoints.default_model());
+        self.config.endpoints.attempts(model)
     }
 
-    async fn call_openai_payload_raw(
+    async fn post_chat_attempt(
         &self,
+        attempt: &endpoints::Attempt,
         messages: &[Value],
         tools: Option<&[Value]>,
         read_timeout: u64,
-        model: Option<&str>,
     ) -> Result<Value, String> {
-        let mut body =
-            json!({"model": model.unwrap_or(&self.config.openai_model), "messages": messages});
+        let mut body = json!({"model": attempt.model, "messages": messages});
         if let Some(tools) = tools {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
         let response = self
             .http
-            .post(&self.config.chat_endpoint)
-            .bearer_auth(&self.config.openai_api_key)
+            .post(&attempt.url)
+            .bearer_auth(&attempt.api_key)
             .timeout(Duration::from_secs(read_timeout + 10))
             .json(&body)
             .send()
@@ -263,30 +242,81 @@ impl State {
                 if error.is_timeout() {
                     "The AI endpoint timed out. Please try again.".to_owned()
                 } else {
-                    "Could not reach the AI endpoint. Check OPENAI_API_BASE_URL and the connection."
+                    "Could not reach the AI endpoint. Check the endpoint URL and the connection."
                         .to_owned()
                 }
             })?;
         let status = response.status();
         if !status.is_success() {
-            let hint = match status {
-                StatusCode::UNAUTHORIZED => "Check OPENAI_API_KEY.",
-                StatusCode::FORBIDDEN => "Check the API key's permissions and model access.",
-                StatusCode::NOT_FOUND => "Check OPENAI_API_BASE_URL and OPENAI_MODEL.",
-                StatusCode::TOO_MANY_REQUESTS => {
-                    "The rate limit or quota was exceeded. Please try again later."
-                }
-                _ => "Check the endpoint configuration or try again later.",
-            };
-            return Err(format!(
-                "The AI endpoint returned HTTP {}. {hint}",
-                status.as_u16()
-            ));
+            return Err(endpoint_status_error(status));
         }
         response
             .json()
             .await
             .map_err(|_| "The AI endpoint returned a non-JSON response.".to_owned())
+    }
+
+    async fn complete_text(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        read_timeout: u64,
+        model: Option<&str>,
+    ) -> Result<(String, String), String> {
+        let tools = tools.map(<[Value]>::to_vec);
+        endpoints::retry_in_order(self.attempts_for(model), |attempt| {
+            let messages = messages.to_vec();
+            let tools = tools.clone();
+            async move {
+                let payload = self
+                    .post_chat_attempt(&attempt, &messages, tools.as_deref(), read_timeout)
+                    .await?;
+                extract_result_text(&payload)
+            }
+        })
+        .await
+    }
+
+    async fn complete_text_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        read_timeout: u64,
+    ) -> Result<(String, String), String> {
+        let messages = messages
+            .iter()
+            .map(|message| serde_json::to_value(message).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.complete_text(&messages, tools, read_timeout, None)
+            .await
+    }
+
+    async fn complete_message(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Value]>,
+        read_timeout: u64,
+    ) -> Result<Value, String> {
+        let messages = messages
+            .iter()
+            .map(|message| serde_json::to_value(message).map_err(|error| error.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tools = tools.map(<[Value]>::to_vec);
+        let (payload, _) = endpoints::retry_in_order(self.attempts_for(None), |attempt| {
+            let messages = messages.clone();
+            let tools = tools.clone();
+            async move {
+                let payload = self
+                    .post_chat_attempt(&attempt, &messages, tools.as_deref(), read_timeout)
+                    .await?;
+                if !has_completion_message(&payload) {
+                    return Err("The AI endpoint returned no completion choices.".into());
+                }
+                Ok(payload)
+            }
+        })
+        .await?;
+        Ok(payload)
     }
 
     async fn generate_chat_response(
@@ -296,7 +326,7 @@ impl State {
         action: &MemoryAction,
         history_override: Option<&[Value]>,
         model: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<GeneratedReply, String> {
         let mut messages = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
         let context: MemoryContext = serde_json::from_value(
             self.memory_mcp
@@ -336,10 +366,24 @@ impl State {
             }));
         }
         messages.push(json!({"role": "user", "content": prompt}));
+        let (text, label) = endpoints::retry_in_order(self.attempts_for(model), |attempt| {
+            self.complete_chat_attempt(&messages, attempt)
+        })
+        .await?;
+        Ok(GeneratedReply { text, label })
+    }
+
+    async fn complete_chat_attempt(
+        &self,
+        base_messages: &[Value],
+        attempt: endpoints::Attempt,
+    ) -> Result<String, String> {
+        // Chat tools are read-only, so a failed later round retries from the original messages.
+        let mut messages = base_messages.to_vec();
         let mut used_weather = false;
         for _ in 0..4 {
             let payload = self
-                .call_openai_payload_raw(&messages, Some(self.memory_mcp.chat_tools()), 90, model)
+                .post_chat_attempt(&attempt, &messages, Some(self.memory_mcp.chat_tools()), 90)
                 .await?;
             let assistant = payload
                 .get("choices")
@@ -399,14 +443,8 @@ impl State {
             ChatMessage::new("system", "Write one short, descriptive title for a Discord chat thread based on the user's question. Use the question's language. Output only the title, with no quotes, markdown, mentions, or extra text. Keep it under 80 characters."),
             ChatMessage::new("user", question),
         ];
-        let proposed = match self.call_openai_payload(&messages, None, 30).await {
-            Ok(payload) => match extract_result_text(&payload) {
-                Ok(title) => title,
-                Err(error) => {
-                    eprintln!("Forum title generation failed: {error}");
-                    String::new()
-                }
-            },
+        let proposed = match self.complete_text_messages(&messages, None, 30).await {
+            Ok((title, _)) => title,
             Err(error) => {
                 eprintln!("Forum title generation failed: {error}");
                 String::new()
@@ -426,7 +464,7 @@ impl State {
             ChatMessage::new("user", user_message),
         ];
         let response = self
-            .call_openai_payload(&messages, Some(self.memory_mcp.model_tools()), 30)
+            .complete_message(&messages, Some(self.memory_mcp.model_tools()), 30)
             .await?;
         let calls = response
             .get("choices")
@@ -499,6 +537,28 @@ impl State {
         }
         Ok(action)
     }
+}
+
+fn endpoint_status_error(status: StatusCode) -> String {
+    let hint = match status {
+        StatusCode::UNAUTHORIZED => "Check the API key.",
+        StatusCode::FORBIDDEN => "Check the API key's permissions and model access.",
+        StatusCode::NOT_FOUND => "Check the endpoint URL and model name.",
+        StatusCode::TOO_MANY_REQUESTS => {
+            "The rate limit or quota was exceeded. Please try again later."
+        }
+        _ => "Check the endpoint configuration or try again later.",
+    };
+    format!("The AI endpoint returned HTTP {}. {hint}", status.as_u16())
+}
+
+fn has_completion_message(payload: &Value) -> bool {
+    payload
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .is_some()
 }
 
 fn extract_result_text(payload: &Value) -> Result<String, String> {
@@ -833,8 +893,12 @@ async fn download_forum_attachment(
     forum::DownloadResult::bytes(attachment.id, body)
 }
 
-async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> BotResult<()> {
-    message
+async fn send_reply(
+    ctx: &Context,
+    message: &Message,
+    content: impl Into<String>,
+) -> BotResult<Message> {
+    Ok(message
         .channel_id
         .send_message(
             &ctx.http,
@@ -843,8 +907,62 @@ async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> 
                 .reference_message(message)
                 .allowed_mentions(CreateAllowedMentions::new().replied_user(false)),
         )
-        .await?;
+        .await?)
+}
+
+async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> BotResult<()> {
+    send_reply(ctx, message, content).await?;
     Ok(())
+}
+
+async fn reply_with_retry(
+    ctx: &Context,
+    message: &Message,
+    content: impl Into<String>,
+) -> BotResult<()> {
+    let sent = send_reply(ctx, message, content).await?;
+    if let Err(error) = sent
+        .react(&ctx.http, ReactionType::Unicode(RETRY_EMOJI.to_owned()))
+        .await
+    {
+        eprintln!("Could not add the retry reaction: {error}");
+    }
+    let _ = RETRY_POSTED.try_with(|flag| flag.store(true, Ordering::Relaxed));
+    Ok(())
+}
+
+tokio::task_local! {
+    static RETRY_POSTED: Arc<AtomicBool>;
+}
+
+fn is_retry_emoji(emoji: &ReactionType) -> bool {
+    let ReactionType::Unicode(value) = emoji else {
+        return false;
+    };
+    value.trim_matches(|character| character == '\u{fe0f}' || character == '\u{fe0e}')
+        == RETRY_EMOJI
+}
+
+fn message_has_bot_retry(reactions: &[MessageReaction]) -> bool {
+    reactions
+        .iter()
+        .any(|reaction| reaction.me && is_retry_emoji(&reaction.reaction_type))
+}
+
+fn asker_may_retry(reactor: u64, asker: u64, bot_id: u64) -> bool {
+    bot_id != 0 && reactor != bot_id && reactor == asker
+}
+
+fn claim_retry(used: &mut HashSet<u64>, message_id: u64) -> bool {
+    used.insert(message_id)
+}
+
+fn release_retry(used: &mut HashSet<u64>, message_id: u64) {
+    used.remove(&message_id);
+}
+
+fn retry_emoji() -> ReactionType {
+    ReactionType::Unicode(RETRY_EMOJI.to_owned())
 }
 
 async fn send_plain(ctx: &Context, message: &Message, content: impl Into<String>) -> BotResult<()> {
@@ -900,7 +1018,12 @@ impl Handler {
         eligible
     }
 
-    async fn answer_forum_message(&self, ctx: &Context, message: &Message) -> BotResult<()> {
+    async fn answer_forum_message(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        repeat: bool,
+    ) -> BotResult<()> {
         let Some(forum) = &self.state.forum else {
             return Ok(());
         };
@@ -931,7 +1054,8 @@ impl Handler {
             .await?;
         let recent = recent.iter().map(ForumMessage::from).collect::<Vec<_>>();
         let bot_id = self.state.bot_id.load(Ordering::Relaxed);
-        if forum::has_answer_for(message.id.get(), &recent, bot_id) {
+        // A 🔄 retry is an explicit second answer. The one-answer guard stays on for new messages.
+        if !repeat && forum::has_answer_for(message.id.get(), &recent, bot_id) {
             return Ok(());
         }
         let member_key = format!("{}:{}", guild.get(), message.author.id.get());
@@ -1024,15 +1148,20 @@ impl Handler {
             )
             .await;
         typing.stop();
-        let response = match result {
-            Ok(response) => response,
+        let generated = match result {
+            Ok(generated) => generated,
             Err(error) => {
                 eprintln!("Forum AI request failed: {error}");
                 return reply(ctx, message, format!("I couldn't reply just now: {error}")).await;
             }
         };
-        for chunk in split_discord_message(&response) {
-            reply(ctx, message, chunk).await?;
+        let visible = endpoints::append_provider_label(&generated.text, &generated.label);
+        for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
+            if index == 0 {
+                reply_with_retry(ctx, message, chunk).await?;
+            } else {
+                reply(ctx, message, chunk).await?;
+            }
         }
         if !forum.is_titled(message.channel_id).await {
             let title = if starter_view.content.is_empty() {
@@ -1137,8 +1266,8 @@ impl Handler {
             )
             .await;
         typing.stop();
-        let response = match response {
-            Ok(response) => response,
+        let generated = match response {
+            Ok(generated) => generated,
             Err(error) => {
                 eprintln!("AI request failed: {error}");
                 reply(
@@ -1150,9 +1279,10 @@ impl Handler {
                 return Ok(());
             }
         };
-        for (index, chunk) in split_discord_message(&response).into_iter().enumerate() {
+        let visible = endpoints::append_provider_label(&generated.text, &generated.label);
+        for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
             if index == 0 {
-                reply(ctx, message, chunk).await?;
+                reply_with_retry(ctx, message, chunk).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1163,7 +1293,7 @@ impl Handler {
                 .memory_mcp
                 .call(
                     "conversation_append",
-                    json!({"prompt":full_prompt,"response":response}),
+                    json!({"prompt":full_prompt,"response":generated.text}),
                     guild.get(),
                     message.author.id.get(),
                     Some(message.channel_id.get()),
@@ -1247,13 +1377,9 @@ impl Handler {
             ),
         ];
         let typing = message.channel_id.start_typing(&ctx.http);
-        let result = self
-            .state
-            .call_openai_payload(&messages, None, 90)
-            .await
-            .and_then(|payload| extract_result_text(&payload));
+        let result = self.state.complete_text_messages(&messages, None, 90).await;
         typing.stop();
-        let mut response = match result {
+        let (mut response, label) = match result {
             Ok(response) => response,
             Err(error) => {
                 eprintln!("Message report failed: {error}");
@@ -1271,9 +1397,10 @@ impl Handler {
                 lines.len()
             );
         }
+        let response = endpoints::append_provider_label(&response, &label);
         for (index, chunk) in split_discord_message(&response).into_iter().enumerate() {
             if index == 0 {
-                reply(ctx, message, chunk).await?;
+                reply_with_retry(ctx, message, chunk).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1288,7 +1415,7 @@ impl Handler {
         } else {
             "Wake names are disabled.".into()
         };
-        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.")).await
+        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.")).await
     }
 
     async fn handle_command(
@@ -1347,6 +1474,15 @@ impl Handler {
     }
 
     async fn handle_message(&self, ctx: &Context, message: &Message) -> BotResult<()> {
+        self.dispatch_message(ctx, message, false).await
+    }
+
+    async fn dispatch_message(
+        &self,
+        ctx: &Context,
+        message: &Message,
+        forum_repeat: bool,
+    ) -> BotResult<()> {
         if message.author.bot || message.guild_id.is_none() {
             return Ok(());
         }
@@ -1355,7 +1491,7 @@ impl Handler {
             let lock = self.state.lock_for(&thread_key).await;
             let _thread_guard = lock.lock().await;
             if self.is_new_forum_thread(ctx, message).await {
-                return self.answer_forum_message(ctx, message).await;
+                return self.answer_forum_message(ctx, message, forum_repeat).await;
             }
         }
         let content = message.content.trim();
@@ -1405,6 +1541,106 @@ impl Handler {
         }
         Ok(())
     }
+
+    async fn retry_from_reaction(&self, ctx: &Context, reaction: &Reaction) -> BotResult<()> {
+        if !is_retry_emoji(&reaction.emoji) {
+            return Ok(());
+        }
+        let Some(reactor) = reaction.user_id else {
+            return Ok(());
+        };
+        let bot_id = self.state.bot_id.load(Ordering::Relaxed);
+        if bot_id == 0 || reactor.get() == bot_id {
+            return Ok(());
+        }
+        if reaction
+            .message_author_id
+            .is_some_and(|author| author.get() != bot_id)
+        {
+            return Ok(());
+        }
+        let message = match reaction
+            .channel_id
+            .message(&ctx.http, reaction.message_id)
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                eprintln!("Could not load the reacted message: {error}");
+                return Ok(());
+            }
+        };
+        if message.author.id.get() != bot_id || !message_has_bot_retry(&message.reactions) {
+            return Ok(());
+        }
+        let Some(original) = referenced_user_message(ctx, &message).await? else {
+            return Ok(());
+        };
+        if !asker_may_retry(reactor.get(), original.author.id.get(), bot_id) {
+            return Ok(());
+        }
+        let message_id = message.id.get();
+        {
+            let mut used = self.state.spent_retries.lock().await;
+            if !claim_retry(&mut used, message_id) {
+                return Ok(());
+            }
+        }
+        // This answer's 🔄 is spent. The new answer gets the next one.
+        if let Err(error) = message
+            .delete_reaction(&ctx.http, None, retry_emoji())
+            .await
+        {
+            eprintln!("Could not remove the retry reaction: {error}");
+        }
+        let posted = Arc::new(AtomicBool::new(false));
+        let result = RETRY_POSTED
+            .scope(
+                Arc::clone(&posted),
+                self.dispatch_message(ctx, &original, true),
+            )
+            .await;
+        if let Err(error) = &result {
+            eprintln!("Retry failed: {error}");
+            let _ = reply(
+                ctx,
+                &original,
+                "The command failed. Please try again later.",
+            )
+            .await;
+        }
+        if result.is_err() || !posted.load(Ordering::Relaxed) {
+            release_retry(&mut *self.state.spent_retries.lock().await, message_id);
+            if let Err(error) = message.react(&ctx.http, retry_emoji()).await {
+                eprintln!("Could not restore the retry reaction: {error}");
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn referenced_user_message(ctx: &Context, message: &Message) -> BotResult<Option<Message>> {
+    if let Some(referenced) = &message.referenced_message {
+        return Ok(Some((**referenced).clone()));
+    }
+    let Some(reference) = &message.message_reference else {
+        return Ok(None);
+    };
+    let Some(id) = reference.message_id else {
+        return Ok(None);
+    };
+    let channel_id = if reference.channel_id.get() == 0 {
+        message.channel_id
+    } else {
+        reference.channel_id
+    };
+    match channel_id.message(&ctx.http, id).await {
+        Ok(message) => Ok(Some(message)),
+        Err(error) => {
+            eprintln!("Could not load the message to retry: {error}");
+            Ok(None)
+        }
+    }
 }
 
 #[serenity::async_trait]
@@ -1415,7 +1651,8 @@ impl EventHandler for Handler {
             .store(ready.user.id.get(), Ordering::Relaxed);
         eprintln!(
             "KnownSphere Bot is ready as {} (model: {})",
-            ready.user.name, self.state.config.openai_model
+            ready.user.name,
+            self.state.config.endpoints.default_label()
         );
     }
 
@@ -1428,6 +1665,12 @@ impl EventHandler for Handler {
                 "The command failed. Please try again later.",
             )
             .await;
+        }
+    }
+
+    async fn reaction_add(&self, ctx: Context, reaction: Reaction) {
+        if let Err(error) = self.retry_from_reaction(&ctx, &reaction).await {
+            eprintln!("Retry failed: {error}");
         }
     }
 }
@@ -1444,6 +1687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let config = Config::load()?;
+    eprintln!("Chat endpoints: {}", config.endpoints.describe());
     let memory_mcp = MemoryMcp::connect().await?;
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -1468,7 +1712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &discord_http,
                 channel,
                 &config.forum_models,
-                &config.openai_model,
+                config.endpoints.default_model(),
             )
             .await?;
         Some(runtime)
@@ -1484,9 +1728,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         bot_id: AtomicU64::new(0),
         forum,
         forum_channel_cache: Mutex::new(HashMap::new()),
+        spent_retries: Mutex::new(HashSet::new()),
     });
-    let intents =
-        GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::GUILDS
+        | GatewayIntents::GUILD_MESSAGES
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_MESSAGE_REACTIONS;
     let mut client = Client::builder(token, intents)
         .event_handler(Handler { state })
         .await?;
@@ -1548,6 +1795,22 @@ mod tests {
             .iter()
             .all(|chunk| chunk.chars().count() <= MAX_DISCORD_MESSAGE_LENGTH));
         assert_eq!(chunks.join(" "), text.trim());
+    }
+
+    #[test]
+    fn retry_reaction_accepts_the_asker_and_the_retry_emoji() {
+        assert!(is_retry_emoji(&ReactionType::Unicode("🔄".into())));
+        assert!(is_retry_emoji(&ReactionType::Unicode("🔄\u{fe0f}".into())));
+        assert!(!is_retry_emoji(&ReactionType::Unicode("👍".into())));
+        assert!(asker_may_retry(7, 7, 1));
+        assert!(!asker_may_retry(1, 7, 1));
+        assert!(!asker_may_retry(9, 7, 1));
+        assert!(!asker_may_retry(7, 7, 0));
+        let mut used = HashSet::new();
+        assert!(claim_retry(&mut used, 10));
+        assert!(!claim_retry(&mut used, 10));
+        release_retry(&mut used, 10);
+        assert!(claim_retry(&mut used, 10));
     }
 
     #[test]

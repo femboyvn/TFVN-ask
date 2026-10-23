@@ -40,6 +40,7 @@ Do not print `DISCORD_TOKEN`, `OPENAI_API_KEY`, or store contents. Do not commit
 | Task | Edit |
 | --- | --- |
 | Commands, mentions, wake names, cooldown, prompts, OpenAI calls | `src/main.rs` |
+| Endpoint catalog, retry order, `provider/model` label | `src/endpoints.rs`, called from `src/main.rs` |
 | Forum eligibility, tags, context, titles | `src/forum.rs` and, if operator steps change, `docs/forum-chat.md` |
 | Memory or conversation records | `src/storage.rs`, then the matching tool in `src/mcp.rs` |
 | MCP protocol, tool catalog, scope injection | `src/mcp.rs` |

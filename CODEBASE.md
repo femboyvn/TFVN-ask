@@ -36,7 +36,7 @@ If `FORUM_TYPE_CHANNEL` is set, startup resolves the channel, requires `ChannelT
 
 ## Message dispatch
 
-`Handler::handle_message` drops messages with no `guild_id` and messages from bots. Gateway intents are `GUILDS`, `GUILD_MESSAGES`, and `MESSAGE_CONTENT`.
+`Handler::handle_message` drops messages with no `guild_id` and messages from bots. Gateway intents are `GUILDS`, `GUILD_MESSAGES`, `MESSAGE_CONTENT`, and `GUILD_MESSAGE_REACTIONS`.
 
 1. When forum mode is on, take the lock `forum:{channel_id}`. If the channel is an eligible thread, `answer_forum_message` handles it and returns.
 2. A message equal to `COMMAND_PREFIX` shows help.
@@ -75,16 +75,19 @@ Normal chat holds a mutex keyed by `{guild}:{user}` so one member's turns cannot
 4. Memory-router notes, when present.
 5. The member prompt.
 6. Up to four model rounds with `chat_tools`. Each round may contain at most four tool calls. Tool errors are returned to the model as `{"error":...}`. A finished answer that used `weather` and omitted the word `open-meteo` gets an Open-Meteo line appended.
+7. `retry_in_order` walks `EndpointSet::attempts`. The preferred model is tried first, on each endpoint that lists it, then the other configured models, at most four attempts. Transport failures, HTTP errors, empty completions, and tool-loop failures try the next attempt. Chat tools are read-only, so a failed attempt starts again from the original messages.
 
-The first Discord chunk replies to the member without pinging them. Later chunks are plain messages. Chunks are at most 1900 characters, split on a newline or space when one sits in the second half of the window.
+The Discord reply ends with `provider/model` for the attempt that answered, for example `openai/gpt-4o-mini`. That label is not stored in conversation history. The first Discord chunk replies to the member without pinging them and gets a 🔄 reaction. Later chunks are plain messages. Chunks are at most 1900 characters, split on a newline or space when one sits in the second half of the window.
+
+The member who sent the original message can add that 🔄 reaction once. The bot removes its reaction from that answer and posts a new one with its own 🔄. Another try uses the new answer's reaction. The bot's own reaction does not count, and the reaction only works on a message the bot itself marked. If the retry does not post a new answer, the same 🔄 is put back. Cooldown and the per-member lock still apply. In a forum thread the retry skips the one-answer guard and posts another reply. Operational replies, help, and errors do not get the reaction. The bot needs the **Add Reactions** permission.
 
 On success, and when the router did not set `skip_history`, the bot calls `conversation_append` with the full prompt and the full response. Forum answers do not append. They pass a `history_override` built from the thread, so the JSON conversation file is not the forum transcript. Forum turns still run the memory router, so an explicit preference request in a forum post can update memory. Visible thread text is still sent as context while memory is off, because that text is already in the channel.
 
-Reports do not use tools or memory. They send the model JSON lines of `{author, content, source_url}` from non-bot messages, capped at 16,000 characters, each content clipped to 600 characters. Mentions in those lines are replaced with display names before a second mention strip.
+Reports do not use tools or memory. They send the model JSON lines of `{author, content, source_url}` from non-bot messages, capped at 16,000 characters, each content clipped to 600 characters. Mentions in those lines are replaced with display names before a second mention strip. The report reply uses the same endpoint retry order and ends with `provider/model`.
 
 ## Memory router
 
-`route_memory` is a separate completion with `MEMORY_ROUTER_PROMPT` and the public memory tools. It reads at most six tool calls. `memory_forget` and `memory_off` set `skip_history`, and later calls in that batch are skipped. The router runs on the default `OPENAI_MODEL`. Guild and user ids are injected in the client; the model cannot address another member. A router failure still produces a chat reply, with a note that no memory action was confirmed.
+`route_memory` is a separate completion with `MEMORY_ROUTER_PROMPT` and the public memory tools. It reads at most six tool calls. `memory_forget` and `memory_off` set `skip_history`, and later calls in that batch are skipped. The router runs on the default model, using the same endpoint retry order. Guild and user ids are injected in the client; the model cannot address another member. A router failure still produces a chat reply, with a note that no memory action was confirmed.
 
 Public tools and their effects:
 
@@ -139,7 +142,7 @@ Preference limits:
 | `define_word` | `api.dictionaryapi.dev` | English word, 1–60 letters plus space, hyphen, or apostrophe. Up to five definitions. |
 | `search_encyclopedia` | English Wikipedia API | Query 2–120 characters. Up to three intro extracts. User-Agent `KnownSphereBot/{version}`. |
 
-Skill HTTP calls time out after 10 seconds. Chat completions use a 90-second read budget plus 10 seconds of client timeout. The router and forum titles use 30 seconds. The MCP client waits 30 seconds for one response line.
+Skill HTTP calls time out after 10 seconds. Each chat attempt uses a 90-second read budget plus 10 seconds of client timeout. The router and forum titles use 30 seconds per attempt. The MCP client waits 30 seconds for one response line.
 
 ## Forum mode
 
@@ -156,7 +159,7 @@ Operator steps live in `docs/forum-chat.md`. Runtime behavior:
 - An opening post with no text is titled from its attachment names, without a model call.
 - The channel cache remembers eligibility for up to 2048 channel ids, then clears.
 - After the first answer, when the opening message has text, the default model writes a title (80 characters, one line, surrounding quotes and a leading `Title:` removed). The thread id is recorded so later messages do not rename it. Title failure is logged and does not fail the answer.
-- The answer itself uses the thread's selected model. Title generation does not.
+- The answer itself uses the thread's selected model, then the endpoint retry order. The reply ends with `provider/model`. Title generation uses the default model and the same retry order, and the title stays plain text.
 
 ## Configuration
 
@@ -165,10 +168,12 @@ Operator steps live in `docs/forum-chat.md`. Runtime behavior:
 | Variable | Required | Default |
 | --- | --- | --- |
 | `DISCORD_TOKEN` | yes | |
-| `OPENAI_API_KEY` | yes | |
-| `OPENAI_MODEL` | no | `gpt-4o-mini` |
+| `ENDPOINTS_CONFIG` | no | `endpoints.json` when that file exists; otherwise the `OPENAI_*` variables |
+| `OPENAI_API_KEY` | yes, unless the JSON config supplies keys | |
+| `OPENAI_MODEL` | no | `gpt-4o-mini`, or the first listed model when the JSON config is used and this variable is unset |
 | `OPENAI_API_BASE_URL` | no | `https://api.openai.com/v1` |
 | `OPENAI_BASE_URL` | no | fallback if `OPENAI_API_BASE_URL` is unset |
+| `OPENAI_PROVIDER` | no | host label, used only for the single env endpoint |
 | `COMMAND_PREFIX` | no | `!knowsphere` |
 | `WAKE_NAMES` | no | `KnownSphere,TransGPT` |
 | `FORUM_TYPE_CHANNEL` | no | unset disables forum mode |
@@ -176,7 +181,9 @@ Operator steps live in `docs/forum-chat.md`. Runtime behavior:
 | `CONVERSATION_STORE_PATH` | no | `.knownsphere_conversations.json` (MCP child) |
 | `MEMORY_STORE_PATH` | no | `.knownsphere_memories.json` (MCP child) |
 
-A base URL that already ends in `/chat/completions` is used as-is. Any other base gains that suffix. The API key is sent as a bearer token. HTTP 401, 403, 404, and 429 map to a one-line hint; other failures stay generic. Response bodies are not shown to the member.
+`endpoints.json`, or the file named by `ENDPOINTS_CONFIG`, lists ordered endpoints. `endpoints.example.json` is the shape. Each endpoint has `name`, `base_url`, `models`, and exactly one of `api_key` or `api_key_env`. Names are 1–40 letters, digits, dots, underscores, or hyphens. Model ids are 1–128 visible ASCII characters without spaces. At most 8 endpoints and 8 models each. A base URL that already ends in `/chat/completions` is used as-is. Any other base gains that suffix. The API key is sent as a bearer token. When `OPENAI_MODEL` is set, that model must be listed and becomes the default. When the file is absent, one endpoint is built from the `OPENAI_*` variables, and its provider name is `OPENAI_PROVIDER` or the host label (`api.openai.com` becomes `openai`). Forum model tags must be listed on some endpoint. In Docker the working directory is `/data`, so the file on the volume is picked up there.
+
+HTTP 401, 403, 404, and 429 map to a one-line hint; other failures stay generic. Response bodies are not shown to the member. A single failed attempt returns that hint. When more than one attempt was tried, the member sees `Every configured endpoint failed. Last error: ...`. Startup logs the attempt labels and no keys.
 
 ## Packaging
 
@@ -184,4 +191,4 @@ A base URL that already ends in `/chat/completions` is used as-is. Any other bas
 
 `.github/workflows/build.yml` on `main` runs fmt, clippy (`-D warnings`), and `cargo test --locked`. Pushes also build Windows and macOS release artifacts and push `ghcr.io/<repo>:main` and `:sha-<commit>`.
 
-Git ignores `.env`, the three `.knownsphere_*.json` files, `*.json.tmp`, and `target/`.
+Git ignores `.env`, `endpoints.json`, the three `.knownsphere_*.json` files, `*.json.tmp`, and `target/`.

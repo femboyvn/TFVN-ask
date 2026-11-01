@@ -9,10 +9,13 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 
 const MAX_ENDPOINTS: usize = 8;
-const MAX_MODELS_PER_ENDPOINT: usize = 8;
+const MAX_MODELS_PER_ENDPOINT: usize = 64;
 const MAX_CHAT_ATTEMPTS: usize = 4;
 const MAX_PROVIDER_CHARS: usize = 40;
 const MAX_MODEL_CHARS: usize = 128;
+const MAX_FORUM_TAGS: usize = 20;
+const MAX_FORUM_TAG_CHARS: usize = 20;
+const OPENAI_ENDPOINT_NAME: &str = "openai";
 
 pub struct Attempt {
     pub provider: String,
@@ -37,6 +40,17 @@ struct Endpoint {
 pub struct EndpointSet {
     endpoints: Vec<Endpoint>,
     default_model: String,
+    /// `provider/model` used after the requested model fails. When absent, the
+    /// walk continues through the other configured models.
+    fallback_model: Option<(String, String)>,
+}
+
+/// A forum tag. `name` is the Discord label, at most 20 characters.
+/// `label` is the full `provider/model` sent to the chat endpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForumModelTag {
+    pub name: String,
+    pub label: String,
 }
 
 #[derive(Deserialize)]
@@ -62,15 +76,19 @@ impl EndpointSet {
         if let Some(path) = configured_path()? {
             let mut set = Self::load_file(&path)?;
             set.select_default_from_env()?;
+            set.select_fallback_from_env()?;
             return Ok(set);
         }
         let default_path = Path::new("endpoints.json");
         if default_path.is_file() {
             let mut set = Self::load_file(default_path)?;
             set.select_default_from_env()?;
+            set.select_fallback_from_env()?;
             return Ok(set);
         }
-        Self::from_process_env(extra_models)
+        let mut set = Self::from_process_env(extra_models)?;
+        set.select_fallback_from_env()?;
+        Ok(set)
     }
 
     pub fn default_model(&self) -> &str {
@@ -92,21 +110,116 @@ impl EndpointSet {
             .join(", ")
     }
 
-    pub fn ensure_known_models(&self, models: &[String]) -> Result<(), String> {
+    /// Every configured `provider/model` pair, in endpoint order.
+    pub fn model_choices(&self) -> Vec<(String, String)> {
+        let mut choices = Vec::new();
+        for endpoint in &self.endpoints {
+            for model in &endpoint.models {
+                let label = format!("{}/{}", endpoint.name, model);
+                choices.push((label.clone(), label));
+            }
+        }
+        choices
+    }
+
+    /// One Discord tag per endpoint that lists each model, in that model order.
+    /// The Discord name is `provider/model`. When that is longer than 20
+    /// characters, a repeated provider word and a trailing `YYYYMMDD` are
+    /// removed. The stored label keeps the full model id.
+    pub fn forum_tags(&self, models: &[String]) -> Result<Vec<ForumModelTag>, String> {
+        let mut tags = Vec::new();
+        let mut used_names = Vec::new();
         for model in models {
-            if self.canonical_model(model).is_none() {
+            let canonical = self.resolve_forum_model(model)?;
+            let mut found = false;
+            for endpoint in &self.endpoints {
+                let Some(configured) = endpoint.models.iter().find(|candidate| {
+                    normalize_model_key(candidate) == normalize_model_key(&canonical)
+                }) else {
+                    continue;
+                };
+                found = true;
+                let name = discord_tag_name(&endpoint.name, configured, &used_names)?;
+                used_names.push(name.clone());
+                tags.push(ForumModelTag {
+                    name,
+                    label: format!("{}/{}", endpoint.name, configured),
+                });
+            }
+            if !found {
                 return Err(format!(
                     "Forum model {model:?} is not listed on any endpoint."
                 ));
             }
         }
-        Ok(())
+        if tags.is_empty() {
+            return Err("At least one forum model is required.".into());
+        }
+        if tags.len() > MAX_FORUM_TAGS {
+            return Err(format!(
+                "A Discord forum supports at most {MAX_FORUM_TAGS} model tags."
+            ));
+        }
+        Ok(tags)
+    }
+
+    /// Exact catalog model, ignoring case and treating `.` like `-`.
+    /// A unique longer id matches when it continues past the requested name
+    /// with a hyphen, so `claude-haiku-4.5` can select one dated id.
+    fn resolve_forum_model(&self, requested: &str) -> Result<String, String> {
+        let requested_key = normalize_model_key(requested);
+        let mut exact = Vec::new();
+        let mut extended = Vec::new();
+        for endpoint in &self.endpoints {
+            for configured in &endpoint.models {
+                let configured_key = normalize_model_key(configured);
+                let bucket = if configured_key == requested_key {
+                    &mut exact
+                } else if configured_key.starts_with(&format!("{requested_key}-")) {
+                    &mut extended
+                } else {
+                    continue;
+                };
+                if !bucket
+                    .iter()
+                    .any(|known: &String| normalize_model_key(known) == configured_key)
+                {
+                    bucket.push(configured.clone());
+                }
+            }
+        }
+        let matches = if !exact.is_empty() { exact } else { extended };
+        match matches.as_slice() {
+            [model] => Ok(model.clone()),
+            [] => Err(format!(
+                "Forum model {requested:?} is not listed on any endpoint."
+            )),
+            _ => Err(format!(
+                "Forum model {requested:?} matches more than one configured model."
+            )),
+        }
     }
 
     /// Preferred model first, on each endpoint that lists it, then the other
     /// configured models. At most four attempts. An unknown model is sent to
-    /// each endpoint before those fallbacks.
+    /// each endpoint before those fallbacks. `FALLBACK_MODEL` replaces that
+    /// other-model walk with one `provider/model` pair.
+    ///
+    /// A `provider/model` choice tries that pair first. If it is not the
+    /// OpenAI endpoint, failure continues on the endpoint named `openai`
+    /// (or the first endpoint when that name is absent): the same model, then
+    /// that endpoint's other models. `FALLBACK_MODEL` replaces those other
+    /// models. Other providers are not tried.
     pub fn attempts(&self, model: &str) -> Vec<Attempt> {
+        if let Some((provider, model_id)) = model.split_once('/') {
+            if !model_id.is_empty() && self.endpoint_named(provider).is_some() {
+                return self.attempts_for_provider(provider, model_id);
+            }
+        }
+        self.attempts_for_model(model)
+    }
+
+    fn attempts_for_model(&self, model: &str) -> Vec<Attempt> {
         let mut attempts = Vec::new();
         for endpoint in &self.endpoints {
             for configured in &endpoint.models {
@@ -120,16 +233,15 @@ impl EndpointSet {
         }
         if attempts.is_empty() {
             for endpoint in &self.endpoints {
-                attempts.push(Attempt {
-                    provider: endpoint.name.clone(),
-                    model: model.to_owned(),
-                    url: endpoint.url.clone(),
-                    api_key: endpoint.api_key.clone(),
-                });
+                attempts.push(endpoint.attempt_model(model));
                 if attempts.len() == MAX_CHAT_ATTEMPTS {
                     return attempts;
                 }
             }
+        }
+        if self.fallback_model.is_some() {
+            self.push_configured_fallback(&mut attempts);
+            return attempts;
         }
         for endpoint in &self.endpoints {
             for configured in &endpoint.models {
@@ -143,6 +255,89 @@ impl EndpointSet {
             }
         }
         attempts
+    }
+
+    fn attempts_for_provider(&self, provider: &str, model: &str) -> Vec<Attempt> {
+        let mut attempts = Vec::new();
+        if let Some(endpoint) = self.endpoint_named(provider) {
+            self.push_model_attempt(&mut attempts, endpoint, model, true);
+        }
+        let fallback = self.fallback_endpoint();
+        let on_fallback = attempts
+            .first()
+            .is_some_and(|attempt| attempt.provider.eq_ignore_ascii_case(&fallback.name));
+        if !on_fallback {
+            self.push_model_attempt(&mut attempts, fallback, model, false);
+        }
+        if self.fallback_model.is_some() {
+            self.push_configured_fallback(&mut attempts);
+            return attempts;
+        }
+        for configured in &fallback.models {
+            if configured.eq_ignore_ascii_case(model) {
+                continue;
+            }
+            if !self.push_attempt(&mut attempts, fallback.attempt(configured)) {
+                break;
+            }
+        }
+        attempts
+    }
+
+    fn endpoint_named(&self, name: &str) -> Option<&Endpoint> {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.name.eq_ignore_ascii_case(name))
+    }
+
+    /// The endpoint named `openai`, otherwise the first configured endpoint.
+    fn fallback_endpoint(&self) -> &Endpoint {
+        self.endpoint_named(OPENAI_ENDPOINT_NAME)
+            .unwrap_or(&self.endpoints[0])
+    }
+
+    fn push_model_attempt(
+        &self,
+        attempts: &mut Vec<Attempt>,
+        endpoint: &Endpoint,
+        model: &str,
+        allow_unknown: bool,
+    ) -> bool {
+        if let Some(configured) = endpoint
+            .models
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(model))
+        {
+            return self.push_attempt(attempts, endpoint.attempt(configured));
+        }
+        if allow_unknown {
+            return self.push_attempt(attempts, endpoint.attempt_model(model));
+        }
+        true
+    }
+
+    fn push_configured_fallback(&self, attempts: &mut Vec<Attempt>) {
+        let Some((provider, model)) = self.fallback_model.clone() else {
+            return;
+        };
+        let Some(endpoint) = self.endpoint_named(&provider) else {
+            return;
+        };
+        self.push_model_attempt(attempts, endpoint, &model, false);
+    }
+
+    fn push_attempt(&self, attempts: &mut Vec<Attempt>, attempt: Attempt) -> bool {
+        let duplicate = attempts.iter().any(|existing| {
+            existing.provider.eq_ignore_ascii_case(&attempt.provider)
+                && existing.model.eq_ignore_ascii_case(&attempt.model)
+        });
+        if !duplicate {
+            if attempts.len() == MAX_CHAT_ATTEMPTS {
+                return false;
+            }
+            attempts.push(attempt);
+        }
+        attempts.len() < MAX_CHAT_ATTEMPTS
     }
 
     fn load_file(path: &Path) -> Result<Self, String> {
@@ -194,6 +389,7 @@ impl EndpointSet {
         Ok(Self {
             endpoints,
             default_model,
+            fallback_model: None,
         })
     }
 
@@ -285,6 +481,7 @@ impl EndpointSet {
         Ok(Self {
             endpoints: vec![endpoint],
             default_model,
+            fallback_model: None,
         })
     }
 
@@ -296,6 +493,43 @@ impl EndpointSet {
             Ok(value) => self.select_default(Some(value.trim())),
             Err(_) => Ok(()),
         }
+    }
+
+    fn select_fallback_from_env(&mut self) -> Result<(), String> {
+        match env::var("FALLBACK_MODEL") {
+            Ok(value) if value.trim().is_empty() => Err("FALLBACK_MODEL is empty.".into()),
+            Ok(value) => self.select_fallback(Some(value.trim())),
+            Err(_) => Ok(()),
+        }
+    }
+
+    fn select_fallback(&mut self, value: Option<&str>) -> Result<(), String> {
+        let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+            self.fallback_model = None;
+            return Ok(());
+        };
+        let Some((provider, model)) = value.split_once('/') else {
+            return Err("FALLBACK_MODEL must be provider/model.".into());
+        };
+        if provider.is_empty() || model.is_empty() || model.contains('/') {
+            return Err("FALLBACK_MODEL must be provider/model.".into());
+        }
+        let Some(endpoint) = self.endpoint_named(provider) else {
+            return Err(format!(
+                "FALLBACK_MODEL provider {provider} is not configured."
+            ));
+        };
+        let Some(canonical) = endpoint
+            .models
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(model))
+        else {
+            return Err(format!(
+                "FALLBACK_MODEL {provider}/{model} is not listed on that endpoint."
+            ));
+        };
+        self.fallback_model = Some((endpoint.name.clone(), canonical.clone()));
+        Ok(())
     }
 
     fn select_default(&mut self, model: Option<&str>) -> Result<(), String> {
@@ -363,6 +597,10 @@ impl Endpoint {
     }
 
     fn attempt(&self, model: &str) -> Attempt {
+        self.attempt_model(model)
+    }
+
+    fn attempt_model(&self, model: &str) -> Attempt {
         Attempt {
             provider: self.name.clone(),
             model: model.to_owned(),
@@ -517,6 +755,97 @@ fn valid_provider_name(name: &str) -> bool {
         })
 }
 
+fn normalize_model_key(model: &str) -> String {
+    model
+        .chars()
+        .map(|character| {
+            if character == '.' {
+                '-'
+            } else {
+                character.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+/// Discord tag names stop at 20 characters. Prefer the full model id, then
+/// drop a leading word shared with the provider, then a trailing date.
+fn discord_tag_name(provider: &str, model: &str, used: &[String]) -> Result<String, String> {
+    for candidate in tag_name_candidates(provider, model) {
+        if candidate.chars().count() > MAX_FORUM_TAG_CHARS {
+            continue;
+        }
+        if used
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&candidate))
+        {
+            continue;
+        }
+        return Ok(candidate);
+    }
+    Err(format!(
+        "Forum model tag for {provider}/{model} must contain 1 to {MAX_FORUM_TAG_CHARS} characters."
+    ))
+}
+
+fn tag_name_candidates(provider: &str, model: &str) -> Vec<String> {
+    let mut shown = vec![model.to_owned()];
+    if let Some(head) = provider.split('-').next().filter(|head| !head.is_empty()) {
+        if let Some(rest) = strip_leading_token(model, head) {
+            shown.push(rest);
+        }
+    }
+    let mut dated = Vec::new();
+    for item in &shown {
+        let mut current = item.clone();
+        while let Some(shorter) = strip_trailing_date(&current) {
+            dated.push(shorter.clone());
+            current = shorter;
+        }
+    }
+    shown.extend(dated);
+    let mut tags = Vec::new();
+    for item in shown {
+        if item.is_empty() {
+            continue;
+        }
+        let tag = format!("{provider}/{item}");
+        if !tags
+            .iter()
+            .any(|known: &String| known.eq_ignore_ascii_case(&tag))
+        {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
+fn strip_leading_token(model: &str, head: &str) -> Option<String> {
+    let model_key = model.to_ascii_lowercase();
+    let head_key = head.to_ascii_lowercase();
+    if model_key.len() <= head_key.len() || !model_key.starts_with(&head_key) {
+        return None;
+    }
+    let rest = model[head_key.len()..].trim_start_matches(['-', '.', '_']);
+    if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_owned())
+    }
+}
+
+fn strip_trailing_date(model: &str) -> Option<String> {
+    let (body, date) = model.rsplit_once('-')?;
+    if !body.is_empty()
+        && date.len() == 8
+        && date.chars().all(|character| character.is_ascii_digit())
+    {
+        Some(body.to_owned())
+    } else {
+        None
+    }
+}
+
 fn valid_model_id(model: &str) -> bool {
     let count = model.chars().count();
     (1..=MAX_MODEL_CHARS).contains(&count)
@@ -641,6 +970,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(set.attempts("one").len(), MAX_CHAT_ATTEMPTS);
+        let mut crowded = sample_config();
+        crowded["endpoints"][0]["models"] = json!((0..MAX_MODELS_PER_ENDPOINT)
+            .map(|index| format!("m{index}"))
+            .collect::<Vec<_>>());
+        EndpointSet::parse(&crowded, |name| {
+            (name == "BACKUP_API_KEY").then(|| "backup-key".to_owned())
+        })
+        .unwrap();
+        crowded["endpoints"][0]["models"] = json!((0..=MAX_MODELS_PER_ENDPOINT)
+            .map(|index| format!("m{index}"))
+            .collect::<Vec<_>>());
+        assert!(expect_err(EndpointSet::parse(&crowded, |_| None)).contains("more than"));
 
         let missing_key = json!({
             "endpoints": [{"name": "openai", "base_url": "https://api.openai.com/v1", "models": ["gpt-4o-mini"]}]
@@ -728,8 +1069,214 @@ mod tests {
         )
         .unwrap();
         assert_eq!(named.default_label(), "gateway/gpt-4o-mini");
-        named.ensure_known_models(&["gpt-4o-mini".into()]).unwrap();
-        assert!(named.ensure_known_models(&["missing".into()]).is_err());
+        assert_eq!(
+            named.forum_tags(&["gpt-4o-mini".into()]).unwrap(),
+            [ForumModelTag {
+                name: "gateway/gpt-4o-mini".into(),
+                label: "gateway/gpt-4o-mini".into(),
+            }]
+        );
+    }
+
+    fn openai_and_backup() -> EndpointSet {
+        EndpointSet::parse(
+            &json!({
+                "endpoints": [
+                    {
+                        "name": "openai",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": "openai-key",
+                        "models": ["gpt-4o-mini", "gpt-4o"]
+                    },
+                    {
+                        "name": "backup",
+                        "base_url": "https://backup.example/v1",
+                        "api_key": "backup-key",
+                        "models": ["gpt-4o-mini", "extra"]
+                    }
+                ]
+            }),
+            |_| None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn forum_tags_are_provider_and_model() {
+        let set = openai_and_backup();
+        assert_eq!(
+            set.forum_tags(&["extra".into(), "gpt-4o-mini".into()])
+                .unwrap(),
+            [
+                ForumModelTag {
+                    name: "backup/extra".into(),
+                    label: "backup/extra".into(),
+                },
+                ForumModelTag {
+                    name: "openai/gpt-4o-mini".into(),
+                    label: "openai/gpt-4o-mini".into(),
+                },
+                ForumModelTag {
+                    name: "backup/gpt-4o-mini".into(),
+                    label: "backup/gpt-4o-mini".into(),
+                },
+            ]
+        );
+        assert!(set.forum_tags(&["missing".into()]).is_err());
+        let long = EndpointSet::parse(
+            &json!({
+                "endpoints": [{
+                    "name": "backup",
+                    "base_url": "https://backup.example/v1",
+                    "api_key": "backup-key",
+                    "models": ["claude-opus-5-5"]
+                }]
+            }),
+            |_| None,
+        )
+        .unwrap();
+        assert!(expect_err(long.forum_tags(&["claude-opus-5-5".into()])).contains("20 characters"));
+    }
+
+    #[test]
+    fn long_forum_tags_keep_a_short_name_and_the_full_model() {
+        let set = EndpointSet::parse(
+            &json!({
+                "endpoints": [
+                    {
+                        "name": "claude",
+                        "base_url": "https://claude.example/v1",
+                        "api_key": "claude-key",
+                        "models": [
+                            "claude-opus-5-5",
+                            "claude-haiku-4-5-20251001",
+                            "claude-opus-4-8"
+                        ]
+                    },
+                    {
+                        "name": "claude-max",
+                        "base_url": "https://max.example/v1",
+                        "api_key": "max-key",
+                        "models": ["claude-opus-5-5"]
+                    }
+                ]
+            }),
+            |_| None,
+        )
+        .unwrap();
+        assert_eq!(
+            set.forum_tags(&[
+                "claude-opus-4.8".into(),
+                "claude-haiku-4.5".into(),
+                "claude-opus-5-5".into(),
+            ])
+            .unwrap(),
+            [
+                ForumModelTag {
+                    name: "claude/opus-4-8".into(),
+                    label: "claude/claude-opus-4-8".into(),
+                },
+                ForumModelTag {
+                    name: "claude/haiku-4-5".into(),
+                    label: "claude/claude-haiku-4-5-20251001".into(),
+                },
+                ForumModelTag {
+                    name: "claude/opus-5-5".into(),
+                    label: "claude/claude-opus-5-5".into(),
+                },
+                ForumModelTag {
+                    name: "claude-max/opus-5-5".into(),
+                    label: "claude-max/claude-opus-5-5".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_backup_tag_falls_back_to_the_openai_endpoint() {
+        let set = openai_and_backup();
+        let labels: Vec<_> = set
+            .attempts("backup/extra")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["backup/extra", "openai/gpt-4o-mini", "openai/gpt-4o"]
+        );
+        let labels: Vec<_> = set
+            .attempts("BACKUP/GPT-4o-mini")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["backup/gpt-4o-mini", "openai/gpt-4o-mini", "openai/gpt-4o"]
+        );
+        let labels: Vec<_> = set
+            .attempts("openai/gpt-4o-mini")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(labels, ["openai/gpt-4o-mini", "openai/gpt-4o"]);
+        let choices = openai_and_backup().model_choices();
+        assert_eq!(
+            choices.first().map(|(name, _)| name.as_str()),
+            Some("openai/gpt-4o-mini")
+        );
+        assert!(choices.iter().any(|(name, _)| name == "backup/extra"));
+        let labels: Vec<_> = sample_set()
+            .attempts("backup/llama-backup")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "backup/llama-backup",
+                "primary/claude-opus-5-5",
+                "primary/gpt-4o-mini"
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_model_replaces_the_other_model_walk() {
+        let mut set = openai_and_backup();
+        set.select_fallback(Some("OpenAI/GPT-4o")).unwrap();
+        let labels: Vec<_> = set
+            .attempts("backup/extra")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(labels, ["backup/extra", "openai/gpt-4o"]);
+        let labels: Vec<_> = set
+            .attempts("gpt-4o-mini")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["openai/gpt-4o-mini", "backup/gpt-4o-mini", "openai/gpt-4o"]
+        );
+        let labels: Vec<_> = set
+            .attempts("openai/gpt-4o")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(labels, ["openai/gpt-4o"]);
+        assert!(set.select_fallback(Some("openai/missing")).is_err());
+        assert!(set.select_fallback(Some("gpt-4o")).is_err());
+        set.select_fallback(None).unwrap();
+        let labels: Vec<_> = set
+            .attempts("backup/extra")
+            .iter()
+            .map(Attempt::label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["backup/extra", "openai/gpt-4o-mini", "openai/gpt-4o"]
+        );
     }
 
     #[test]

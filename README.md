@@ -27,6 +27,7 @@ Copy `.env.example` to `.env` in the working directory and replace the placehold
 | `OPENAI_API_KEY` | yes, unless the endpoint file supplies keys | | Bearer token for the chat API. Also the key for the `openai` entry in `endpoints.example.json` |
 | `BACKUP_API_KEY` | no | | Key for the `backup` entry in `endpoints.example.json` |
 | `OPENAI_MODEL` | no | `gpt-4o-mini` | Default model. With an endpoint file, it must be listed there |
+| `FALLBACK_MODEL` | no | the other configured models | `provider/model` tried after the requested model fails. It must be listed on that endpoint |
 | `OPENAI_API_BASE_URL` | no | `https://api.openai.com/v1` | API origin for the single env endpoint. `OPENAI_BASE_URL` is used when this is unset |
 | `COMMAND_PREFIX` | no | `!knowsphere` | Command prefix |
 | `WAKE_NAMES` | no | `KnownSphere,TransGPT` | Up to 12 comma-separated names |
@@ -80,11 +81,11 @@ These also start a chat:
 - A reply to one of the bot's messages.
 - A message that starts with a wake name, optionally after `hey`, `hi`, `hello`, `yo`, `ê`, `này`, or `alo`. Matching ignores case. `TransGPT, what should I wear?` works. `I called TransGPT yesterday` does not.
 
-Each member can send a request every 8 seconds. Long answers are split into messages of at most 1900 characters. The bot replies without pinging the member. The first part of an answer has a 🔄 reaction. The member who asked can add that reaction once. The next try is the 🔄 on the new answer.
+Each member can send a request every 8 seconds. Long answers are split into messages of at most 1900 characters. The bot replies without pinging the member. The first part of an answer has a 🔄 reaction and a Change model button. The member who asked can add that reaction once. The next try is the 🔄 on the new answer. Change model sends a menu; picking a model posts a new answer with that model.
 
 `summarize`, `actions`, and `decisions` read earlier messages in the channel. They cite Discord message links and skip bot messages.
 
-Outside forum threads, the model is `OPENAI_MODEL`.
+Outside forum threads, the model starts as `OPENAI_MODEL`. Change model can pick another configured model for that answer.
 
 ## What it can look up
 
@@ -126,7 +127,7 @@ The bot keeps these in a child process of the same binary (`knowsphere --memory-
 
 ## Forum channel
 
-Set `FORUM_TYPE_CHANNEL` to a forum's numeric id. On startup the bot checks that the channel exists and is a forum, then adds one tag per model. Members open a post, pick a model tag, and continue in the thread. A post or reply can include text, images, and files. Posts created before the first successful start stay inactive. Changing the forum id starts a new activation time.
+Set `FORUM_TYPE_CHANNEL` to a forum's numeric id. On startup the bot checks that the channel exists and is a forum, then adds one `provider/model` tag for each endpoint that lists a forum model. A failed tag on another provider continues on the `openai` endpoint. Members open a post, pick a model tag, and continue in the thread. A post or reply can include text, images, and files. Posts created before the first successful start stay inactive. Changing the forum id starts a new activation time.
 
 Prefix commands do not run inside an enrolled forum thread. Elsewhere, chat works as before.
 

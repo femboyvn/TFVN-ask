@@ -59,29 +59,25 @@ pub fn parse_model_tags(
 }
 
 fn model_tag_payload(existing: &[ForumTag], models: &[String]) -> Result<Option<Value>, String> {
-    let missing = models
-        .iter()
-        .filter(|model| {
-            !existing
-                .iter()
-                .any(|tag| tag.name.eq_ignore_ascii_case(model))
-        })
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return Ok(None);
-    }
-    if existing.len() + missing.len() > MAX_FORUM_TAGS {
+    if models.len() > MAX_FORUM_TAGS {
         return Err(format!(
-            "The forum has {} tags and needs {} more model tags, exceeding Discord's limit of {MAX_FORUM_TAGS}",
-            existing.len(), missing.len()
+            "The environment lists {} model tags, exceeding Discord's limit of {MAX_FORUM_TAGS}.",
+            models.len()
         ));
     }
-    // Include existing IDs, moderation settings, and emoji so Discord keeps those tags intact.
-    let mut tags = existing
+    let already_matches = existing.len() == models.len()
+        && existing
+            .iter()
+            .zip(models)
+            .all(|(tag, model)| tag.name.eq_ignore_ascii_case(model));
+    if already_matches {
+        return Ok(None);
+    }
+    // Omit every existing id. Discord deletes tags that are not sent back.
+    let tags = models
         .iter()
-        .map(|tag| serde_json::to_value(tag).map_err(|error| error.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    tags.extend(missing.into_iter().map(|model| json!({"name": model})));
+        .map(|model| json!({"name": model}))
+        .collect::<Vec<_>>();
     Ok(Some(json!({"available_tags": tags})))
 }
 
@@ -195,13 +191,22 @@ impl ForumRuntime {
         &mut self,
         http: &Http,
         forum: GuildChannel,
-        models: &[String],
-        default_model: &str,
+        models: &[crate::endpoints::ForumModelTag],
+        default_label: &str,
     ) -> Result<(), String> {
         if models.is_empty() {
             return Err("At least one forum model is required".into());
         }
-        let updated = match model_tag_payload(&forum.available_tags, models)? {
+        let default_name = models
+            .iter()
+            .find(|model| model.label.eq_ignore_ascii_case(default_label))
+            .map(|model| model.name.as_str())
+            .ok_or_else(|| format!("Default model {default_label} has no forum tag."))?;
+        let names = models
+            .iter()
+            .map(|model| model.name.clone())
+            .collect::<Vec<_>>();
+        let updated = match model_tag_payload(&forum.available_tags, &names)? {
             Some(payload) => http
                 .edit_channel(self.forum_id, &payload, None)
                 .await
@@ -214,19 +219,21 @@ impl ForumRuntime {
             let tag = updated
                 .available_tags
                 .iter()
-                .find(|tag| tag.name.eq_ignore_ascii_case(model))
-                .ok_or_else(|| format!("Discord did not return the forum tag for {model}"))?;
-            self.model_tags.insert(tag.id, model.clone());
+                .find(|tag| tag.name.eq_ignore_ascii_case(&model.name))
+                .ok_or_else(|| {
+                    format!("Discord did not return the forum tag for {}", model.name)
+                })?;
+            self.model_tags.insert(tag.id, model.label.clone());
             self.model_order.push(tag.id);
         }
         self.default_model_tag = updated
             .available_tags
             .iter()
-            .find(|tag| tag.name.eq_ignore_ascii_case(default_model))
+            .find(|tag| tag.name.eq_ignore_ascii_case(default_name))
             .map(|tag| tag.id);
         if self.default_model_tag.is_none() {
             return Err(format!(
-                "Discord did not return the default model tag for {default_model}"
+                "Discord did not return the default model tag for {default_name}"
             ));
         }
         Ok(())
@@ -361,7 +368,9 @@ impl DownloadResult {
 fn is_operational_reply(content: &str) -> bool {
     content.starts_with("Please wait ")
         || content.starts_with("I couldn't reply just now:")
+        || content.starts_with("Rewriting that answer with ")
         || content == "The command failed. Please try again later."
+        || content == "Which model should I use?"
 }
 
 pub fn has_answer_for(message_id: u64, recent: &[ForumMessage], bot_id: u64) -> bool {
@@ -1025,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_model_tags_preserves_existing_ids_and_settings() {
+    fn model_tags_replace_the_forum_list_from_the_environment() {
         let existing: ForumTag = serde_json::from_value(json!({
             "id": "123", "name": "Community", "moderated": true,
             "emoji_id": null, "emoji_name": "🐱"
@@ -1036,10 +1045,16 @@ mod tests {
             .unwrap()
             .unwrap();
         let tags = payload["available_tags"].as_array().unwrap();
-        assert_eq!(tags.len(), 3);
-        assert_eq!(tags[0], serde_json::to_value(&existing).unwrap());
-        assert_eq!(tags[1]["name"], "gpt-6-ultra");
-        assert!(model_tag_payload(&[existing], &["community".into()])
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0]["name"], "gpt-6-ultra");
+        assert!(tags[0].get("id").is_none());
+        assert_eq!(tags[1]["name"], "claude-opus-5.5");
+        let current: ForumTag = serde_json::from_value(json!({
+            "id": "9", "name": "gpt-6-ultra", "moderated": false,
+            "emoji_id": null, "emoji_name": null
+        }))
+        .unwrap();
+        assert!(model_tag_payload(&[current], &["GPT-6-ULTRA".into()])
             .unwrap()
             .is_none());
     }
@@ -1165,6 +1180,14 @@ mod tests {
                 "Please wait 2 more second(s) before your next request.",
             ),
             item(22, 99, true, Some(10), "I couldn't reply just now: timeout"),
+            item(25, 99, true, Some(10), "Which model should I use?"),
+            item(
+                26,
+                99,
+                true,
+                Some(10),
+                "Rewriting that answer with claude/claude-opus-5-5.",
+            ),
             item(23, 98, true, Some(10), "Another bot's answer"),
         ];
         assert!(!has_answer_for(10, &recent, 99));

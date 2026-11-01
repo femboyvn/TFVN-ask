@@ -13,10 +13,15 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use serenity::all::{
-    Channel, ChannelId, ChannelType, Context, EventHandler, GatewayIntents, Message,
-    MessageReaction, Reaction, ReactionType, Ready,
+    ButtonStyle, Channel, ChannelId, ChannelType, ComponentInteraction,
+    ComponentInteractionDataKind, Context, EventHandler, GatewayIntents, Interaction, Message,
+    MessageId, MessageReaction, Reaction, ReactionType, Ready,
 };
-use serenity::builder::{CreateAllowedMentions, CreateMessage, EditThread, GetMessages};
+use serenity::builder::{
+    CreateActionRow, CreateAllowedMentions, CreateButton, CreateInteractionResponse,
+    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
+    CreateSelectMenuOption, EditThread, GetMessages,
+};
 use serenity::Client;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -34,6 +39,10 @@ const MAX_REPORT_TRANSCRIPT_CHARS: usize = 16_000;
 const MAX_REPORT_MESSAGE_CHARS: usize = 600;
 const COOLDOWN_SECONDS: u64 = 8;
 const RETRY_EMOJI: &str = "🔄";
+const CHANGE_MODEL_BUTTON: &str = "change-model";
+const MODEL_PICK_PREFIX: &str = "model-pick:";
+const MAX_SELECT_OPTIONS: usize = 25;
+const MAX_SELECT_CHARS: usize = 100;
 const SYSTEM_PROMPT: &str = r#"You are KnownSphere, a friendly companion in a femboy-friendly Discord server.
 Be welcoming to everyone. Never assume a person's gender, identity, pronouns, or interests.
 Your usual voice is very uwu: playful wording, affectionate warmth, and frequent kaomoji.
@@ -130,7 +139,7 @@ struct Config {
     command_prefix: String,
     wake_names: Vec<String>,
     forum_channel: Option<ChannelId>,
-    forum_models: Vec<String>,
+    forum_models: Vec<endpoints::ForumModelTag>,
 }
 
 struct GeneratedReply {
@@ -156,8 +165,7 @@ impl Config {
         let forum_models = if forum_channel.is_some() {
             let models =
                 forum::parse_model_tags(endpoints.default_model(), extra_models.as_deref())?;
-            endpoints.ensure_known_models(&models)?;
-            models
+            endpoints.forum_tags(&models)?
         } else {
             Vec::new()
         };
@@ -187,6 +195,7 @@ struct State {
     forum: Option<ForumRuntime>,
     forum_channel_cache: Mutex<HashMap<ChannelId, bool>>,
     spent_retries: Mutex<HashSet<u64>>,
+    model_rewrites: Mutex<HashSet<u64>>,
 }
 
 impl State {
@@ -203,14 +212,22 @@ impl State {
         let mut requests = self.last_request.lock().await;
         let now = Instant::now();
         if let Some(last) = requests.get(key) {
-            let remaining =
-                Duration::from_secs(COOLDOWN_SECONDS).saturating_sub(now.duration_since(*last));
-            if !remaining.is_zero() {
-                return remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+            let remaining = cooldown_left_since(*last, now);
+            if remaining > 0 {
+                return remaining;
             }
         }
         requests.insert(key.to_owned(), now);
         0
+    }
+
+    /// Seconds left on the member cooldown. Does not record a new request.
+    async fn cooldown_left(&self, key: &str) -> u64 {
+        let requests = self.last_request.lock().await;
+        requests
+            .get(key)
+            .map(|last| cooldown_left_since(*last, Instant::now()))
+            .unwrap_or(0)
     }
 
     fn attempts_for(&self, model: Option<&str>) -> Vec<endpoints::Attempt> {
@@ -282,12 +299,13 @@ impl State {
         messages: &[ChatMessage],
         tools: Option<&[Value]>,
         read_timeout: u64,
+        model: Option<&str>,
     ) -> Result<(String, String), String> {
         let messages = messages
             .iter()
             .map(|message| serde_json::to_value(message).map_err(|error| error.to_string()))
             .collect::<Result<Vec<_>, _>>()?;
-        self.complete_text(&messages, tools, read_timeout, None)
+        self.complete_text(&messages, tools, read_timeout, model)
             .await
     }
 
@@ -443,7 +461,7 @@ impl State {
             ChatMessage::new("system", "Write one short, descriptive title for a Discord chat thread based on the user's question. Use the question's language. Output only the title, with no quotes, markdown, mentions, or extra text. Keep it under 80 characters."),
             ChatMessage::new("user", question),
         ];
-        let proposed = match self.complete_text_messages(&messages, None, 30).await {
+        let proposed = match self.complete_text_messages(&messages, None, 30, None).await {
             Ok((title, _)) => title,
             Err(error) => {
                 eprintln!("Forum title generation failed: {error}");
@@ -920,7 +938,21 @@ async fn reply_with_retry(
     message: &Message,
     content: impl Into<String>,
 ) -> BotResult<()> {
-    let sent = send_reply(ctx, message, content).await?;
+    let sent = message
+        .channel_id
+        .send_message(
+            &ctx.http,
+            CreateMessage::new()
+                .content(content.into())
+                .reference_message(message)
+                .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
+                .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                    CHANGE_MODEL_BUTTON,
+                )
+                .label("Change model")
+                .style(ButtonStyle::Secondary)])]),
+        )
+        .await?;
     if let Err(error) = sent
         .react(&ctx.http, ReactionType::Unicode(RETRY_EMOJI.to_owned()))
         .await
@@ -933,6 +965,126 @@ async fn reply_with_retry(
 
 tokio::task_local! {
     static RETRY_POSTED: Arc<AtomicBool>;
+    static MODEL_OVERRIDE: String;
+}
+
+fn model_override() -> Option<String> {
+    MODEL_OVERRIDE.try_with(Clone::clone).ok()
+}
+
+fn cooldown_left_since(last: Instant, now: Instant) -> u64 {
+    let remaining = Duration::from_secs(COOLDOWN_SECONDS).saturating_sub(now.duration_since(last));
+    if remaining.is_zero() {
+        0
+    } else {
+        remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)
+    }
+}
+
+fn model_pick_id(asker: u64, question: u64) -> String {
+    format!("{MODEL_PICK_PREFIX}{asker}:{question}")
+}
+
+fn parse_model_pick(custom_id: &str) -> Option<(u64, u64)> {
+    let rest = custom_id.strip_prefix(MODEL_PICK_PREFIX)?;
+    let (asker, question) = rest.split_once(':')?;
+    Some((asker.parse().ok()?, question.parse().ok()?))
+}
+
+/// Discord allows 25 options, and both the label and the value must be 1–100 characters.
+fn select_options(choices: &[(String, String)]) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut options = Vec::new();
+    for (name, value) in choices {
+        if options.len() == MAX_SELECT_OPTIONS {
+            break;
+        }
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty()
+            || value.is_empty()
+            || name.chars().count() > MAX_SELECT_CHARS
+            || value.chars().count() > MAX_SELECT_CHARS
+        {
+            continue;
+        }
+        if !seen.insert(value.to_ascii_lowercase()) {
+            continue;
+        }
+        options.push((name.to_owned(), value.to_owned()));
+    }
+    options
+}
+
+fn model_menu_choices(
+    forum: bool,
+    forum_models: &[endpoints::ForumModelTag],
+    catalog: &[(String, String)],
+) -> Vec<(String, String)> {
+    if forum {
+        let pairs = forum_models
+            .iter()
+            .map(|tag| (tag.name.clone(), tag.label.clone()))
+            .collect::<Vec<_>>();
+        select_options(&pairs)
+    } else {
+        select_options(catalog)
+    }
+}
+
+fn component_user_id(interaction: &ComponentInteraction) -> u64 {
+    if let Some(member) = &interaction.member {
+        member.user.id.get()
+    } else {
+        interaction.user.id.get()
+    }
+}
+
+fn model_select_row(custom_id: &str, options: &[(String, String)]) -> CreateActionRow {
+    let options = options
+        .iter()
+        .map(|(name, value)| CreateSelectMenuOption::new(name, value))
+        .collect();
+    CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(custom_id, CreateSelectMenuKind::String { options })
+            .placeholder("Choose a model"),
+    )
+}
+
+fn ephemeral_notice(content: impl Into<String>) -> CreateInteractionResponse {
+    CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(content)
+            .ephemeral(true)
+            .allowed_mentions(CreateAllowedMentions::new()),
+    )
+}
+
+fn public_menu(content: impl Into<String>, row: CreateActionRow) -> CreateInteractionResponse {
+    CreateInteractionResponse::Message(
+        CreateInteractionResponseMessage::new()
+            .content(content)
+            .allowed_mentions(CreateAllowedMentions::new())
+            .components(vec![row]),
+    )
+}
+
+fn replace_notice(content: impl Into<String>) -> CreateInteractionResponse {
+    CreateInteractionResponse::UpdateMessage(
+        CreateInteractionResponseMessage::new()
+            .content(content)
+            .components(vec![])
+            .allowed_mentions(CreateAllowedMentions::new()),
+    )
+}
+
+async fn respond(
+    ctx: &Context,
+    interaction: &ComponentInteraction,
+    response: CreateInteractionResponse,
+) -> BotResult<()> {
+    interaction.create_response(&ctx.http, response).await?;
+    Ok(())
 }
 
 fn is_retry_emoji(emoji: &ReactionType) -> bool {
@@ -1072,13 +1224,24 @@ impl Handler {
             Channel::Guild(thread) => thread,
             _ => return Ok(()),
         };
-        let (model, default_tag) = match forum.selected_model(&thread) {
-            Ok(selection) => selection,
-            Err(error) => {
-                return reply(ctx, message, format!("I couldn't reply just now: {error}")).await
+        let override_model = model_override();
+        let selection = if override_model.is_none() {
+            match forum.selected_model(&thread) {
+                Ok(selection) => Some(selection),
+                Err(error) => {
+                    return reply(ctx, message, format!("I couldn't reply just now: {error}")).await
+                }
             }
+        } else {
+            None
         };
-        if let Some(default_tag) = default_tag {
+        let model = override_model.as_deref().unwrap_or_else(|| {
+            selection
+                .as_ref()
+                .map(|(model, _)| *model)
+                .unwrap_or(self.state.config.endpoints.default_model())
+        });
+        if let Some(default_tag) = selection.and_then(|(_, tag)| tag) {
             if thread.applied_tags.len() >= 5 {
                 return reply(ctx, message, "I couldn't reply just now: This post has five tags. Remove one so I can add the model tag.").await;
             }
@@ -1262,7 +1425,7 @@ impl Handler {
                 },
                 &action,
                 None,
-                None,
+                model_override().as_deref(),
             )
             .await;
         typing.stop();
@@ -1377,7 +1540,10 @@ impl Handler {
             ),
         ];
         let typing = message.channel_id.start_typing(&ctx.http);
-        let result = self.state.complete_text_messages(&messages, None, 90).await;
+        let result = self
+            .state
+            .complete_text_messages(&messages, None, 90, model_override().as_deref())
+            .await;
         typing.stop();
         let (mut response, label) = match result {
             Ok(response) => response,
@@ -1415,7 +1581,7 @@ impl Handler {
         } else {
             "Wake names are disabled.".into()
         };
-        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.")).await
+        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.\nPress Change model on an answer, then pick the new model from the list.")).await
     }
 
     async fn handle_command(
@@ -1617,6 +1783,220 @@ impl Handler {
         }
         Ok(())
     }
+
+    async fn model_options(&self, ctx: &Context, message: &Message) -> Vec<(String, String)> {
+        let forum = self.is_new_forum_thread(ctx, message).await;
+        model_menu_choices(
+            forum,
+            &self.state.config.forum_models,
+            &self.state.config.endpoints.model_choices(),
+        )
+    }
+
+    async fn change_model(
+        &self,
+        ctx: &Context,
+        interaction: &ComponentInteraction,
+    ) -> BotResult<()> {
+        let custom_id = interaction.data.custom_id.as_str();
+        let handled = custom_id == CHANGE_MODEL_BUTTON || parse_model_pick(custom_id).is_some();
+        if !handled {
+            return Ok(());
+        }
+        let bot_id = self.state.bot_id.load(Ordering::Relaxed);
+        if bot_id == 0 || interaction.message.author.id.get() != bot_id {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I couldn't change the model just now."),
+            )
+            .await;
+        }
+        match &interaction.data.kind {
+            ComponentInteractionDataKind::Button if custom_id == CHANGE_MODEL_BUTTON => {
+                self.offer_model_menu(ctx, interaction).await
+            }
+            ComponentInteractionDataKind::StringSelect { values }
+                if parse_model_pick(custom_id).is_some() =>
+            {
+                self.apply_model_pick(ctx, interaction, values).await
+            }
+            _ => {
+                respond(
+                    ctx,
+                    interaction,
+                    ephemeral_notice("I couldn't change the model just now."),
+                )
+                .await
+            }
+        }
+    }
+
+    async fn offer_model_menu(
+        &self,
+        ctx: &Context,
+        interaction: &ComponentInteraction,
+    ) -> BotResult<()> {
+        let Some(original) = referenced_user_message(ctx, &interaction.message).await? else {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I couldn't find the message to answer again."),
+            )
+            .await;
+        };
+        let bot_id = self.state.bot_id.load(Ordering::Relaxed);
+        if !asker_may_retry(
+            component_user_id(interaction),
+            original.author.id.get(),
+            bot_id,
+        ) {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("Only the person who asked can change the model."),
+            )
+            .await;
+        }
+        let options = self.model_options(ctx, &interaction.message).await;
+        if options.is_empty() {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I don't have any models to offer."),
+            )
+            .await;
+        }
+        let custom_id = model_pick_id(original.author.id.get(), original.id.get());
+        respond(
+            ctx,
+            interaction,
+            public_menu(
+                "Which model should I use?",
+                model_select_row(&custom_id, &options),
+            ),
+        )
+        .await
+    }
+
+    async fn apply_model_pick(
+        &self,
+        ctx: &Context,
+        interaction: &ComponentInteraction,
+        values: &[String],
+    ) -> BotResult<()> {
+        let Some((asker, question_id)) = parse_model_pick(&interaction.data.custom_id) else {
+            return Ok(());
+        };
+        let bot_id = self.state.bot_id.load(Ordering::Relaxed);
+        if !asker_may_retry(component_user_id(interaction), asker, bot_id) {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("Only the person who asked can change the model."),
+            )
+            .await;
+        }
+        let Some(guild_id) = interaction.guild_id else {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I only change models in a server."),
+            )
+            .await;
+        };
+        let Some(value) = values.first() else {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("Pick a model from the list."),
+            )
+            .await;
+        };
+        let options = self.model_options(ctx, &interaction.message).await;
+        let Some((_, chosen)) = options.iter().find(|(_, option)| option == value) else {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("That model is not in the list."),
+            )
+            .await;
+        };
+        let chosen = chosen.clone();
+        // cooldown_remaining records the request. A rejected pick must not start that wait.
+        let member_key = format!("{}:{}", guild_id.get(), asker);
+        let remaining = self.state.cooldown_left(&member_key).await;
+        if remaining > 0 {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice(format!(
+                    "Please wait {remaining} more second(s) before your next request."
+                )),
+            )
+            .await;
+        }
+        let question = match interaction
+            .channel_id
+            .message(&ctx.http, MessageId::new(question_id))
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                eprintln!("Could not load the message to rewrite: {error}");
+                return respond(
+                    ctx,
+                    interaction,
+                    ephemeral_notice("I couldn't find the message to answer again."),
+                )
+                .await;
+            }
+        };
+        if question.author.bot
+            || question.author.id.get() != asker
+            || question.guild_id != Some(guild_id)
+        {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I couldn't find the message to answer again."),
+            )
+            .await;
+        }
+        if !claim_retry(&mut *self.state.model_rewrites.lock().await, question_id) {
+            return respond(
+                ctx,
+                interaction,
+                ephemeral_notice("I'm already rewriting that answer."),
+            )
+            .await;
+        }
+        // Generation can outlast Discord's 3-second interaction window.
+        if let Err(error) = respond(
+            ctx,
+            interaction,
+            replace_notice(format!("Rewriting that answer with {chosen}.")),
+        )
+        .await
+        {
+            release_retry(&mut *self.state.model_rewrites.lock().await, question_id);
+            return Err(error);
+        }
+        let result = MODEL_OVERRIDE
+            .scope(chosen, self.dispatch_message(ctx, &question, true))
+            .await;
+        release_retry(&mut *self.state.model_rewrites.lock().await, question_id);
+        if let Err(error) = result {
+            eprintln!("Change model failed: {error}");
+            let _ = reply(
+                ctx,
+                &question,
+                "The command failed. Please try again later.",
+            )
+            .await;
+        }
+        Ok(())
+    }
 }
 
 async fn referenced_user_message(ctx: &Context, message: &Message) -> BotResult<Option<Message>> {
@@ -1673,6 +2053,15 @@ impl EventHandler for Handler {
             eprintln!("Retry failed: {error}");
         }
     }
+
+    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
+        let Interaction::Component(interaction) = interaction else {
+            return;
+        };
+        if let Err(error) = self.change_model(&ctx, &interaction).await {
+            eprintln!("Change model failed: {error}");
+        }
+    }
 }
 
 #[tokio::main]
@@ -1712,7 +2101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &discord_http,
                 channel,
                 &config.forum_models,
-                config.endpoints.default_model(),
+                &config.endpoints.default_label(),
             )
             .await?;
         Some(runtime)
@@ -1729,6 +2118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         forum,
         forum_channel_cache: Mutex::new(HashMap::new()),
         spent_retries: Mutex::new(HashSet::new()),
+        model_rewrites: Mutex::new(HashSet::new()),
     });
     let intents = GatewayIntents::GUILDS
         | GatewayIntents::GUILD_MESSAGES
@@ -1811,6 +2201,80 @@ mod tests {
         assert!(!claim_retry(&mut used, 10));
         release_retry(&mut used, 10);
         assert!(claim_retry(&mut used, 10));
+    }
+
+    #[test]
+    fn cooldown_rounds_up_a_partial_second() {
+        let now = Instant::now();
+        assert_eq!(cooldown_left_since(now, now), COOLDOWN_SECONDS);
+        assert_eq!(
+            cooldown_left_since(now - Duration::from_secs(COOLDOWN_SECONDS), now),
+            0
+        );
+        assert_eq!(
+            cooldown_left_since(now - Duration::from_secs(COOLDOWN_SECONDS - 1), now),
+            1
+        );
+        assert_eq!(
+            cooldown_left_since(now - Duration::from_millis(7_500), now),
+            1
+        );
+    }
+
+    #[test]
+    fn model_menu_keeps_forum_labels_and_discord_select_limits() {
+        let id = model_pick_id(u64::MAX, u64::MAX);
+        assert!(id.chars().count() <= 100);
+        assert_eq!(parse_model_pick(&id), Some((u64::MAX, u64::MAX)));
+        assert_eq!(parse_model_pick("model-pick:12:34"), Some((12, 34)));
+        assert_eq!(parse_model_pick("change-model"), None);
+        assert_eq!(parse_model_pick("model-pick:nope:34"), None);
+        assert_eq!(parse_model_pick("model-pick:12"), None);
+        assert_eq!(parse_model_pick("model-pick:12:34:56"), None);
+
+        let tags = vec![endpoints::ForumModelTag {
+            name: "claude/opus-5-5".into(),
+            label: "claude/claude-opus-5-5".into(),
+        }];
+        let forum_options = model_menu_choices(true, &tags, &[]);
+        assert_eq!(
+            forum_options,
+            vec![("claude/opus-5-5".into(), "claude/claude-opus-5-5".into())]
+        );
+
+        let mut choices = vec![
+            ("ok".into(), "openai/gpt-4o-mini".into()),
+            ("again".into(), "openai/gpt-4o-mini".into()),
+            ("other".into(), "OpenAI/GPT-4o-mini".into()),
+            (String::new(), "backup/extra".into()),
+            ("backup".into(), String::new()),
+            (
+                "x".repeat(MAX_SELECT_CHARS + 1),
+                "backup/too-long-name".into(),
+            ),
+            ("long-value".into(), "y".repeat(MAX_SELECT_CHARS + 1)),
+            ("backup".into(), "backup/extra".into()),
+        ];
+        for index in 0..30 {
+            choices.push((format!("model-{index}"), format!("provider/model-{index}")));
+        }
+        let options = select_options(&choices);
+        assert_eq!(options.len(), MAX_SELECT_OPTIONS);
+        assert_eq!(options[0].1, "openai/gpt-4o-mini");
+        assert_eq!(options[1].1, "backup/extra");
+        assert!(options.iter().all(|(name, value)| {
+            !name.is_empty()
+                && !value.is_empty()
+                && name.chars().count() <= MAX_SELECT_CHARS
+                && value.chars().count() <= MAX_SELECT_CHARS
+        }));
+        assert_eq!(
+            options
+                .iter()
+                .filter(|(_, value)| value.eq_ignore_ascii_case("openai/gpt-4o-mini"))
+                .count(),
+            1
+        );
     }
 
     #[test]

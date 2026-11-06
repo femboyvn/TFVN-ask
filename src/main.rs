@@ -1,5 +1,6 @@
 mod calculator;
 mod endpoints;
+mod export;
 mod forum;
 mod knowledge;
 mod mcp;
@@ -77,6 +78,12 @@ member supplied. y = x! is the formula x!, with postfix factorial. Do not
 invent points or an x range; ask for the range when a formula has none. Do not
 write Python, matplotlib, or other source code. When the tool result says
 image_attached, write a short caption only. The bot attaches the chart image.
+When a member asks to export, download, or save an Excel sheet, Markdown,
+plain text, or source code, call export_file. Bundle every requested part
+into that one Markdown file. Include the full text they asked for. Do not
+shorten the file to fit a chat message, and do not invent rows, code, or
+text. Do not call it for a normal answer. When the tool result says
+file_attached, write a short caption only. The bot attaches the Markdown file.
 For dice rolls, use roll_dice and report the actual rolls and total.
 For English word meanings, use define_word. For background facts, use
 search_encyclopedia and cite the source page. These sources can be incomplete or
@@ -152,6 +159,7 @@ struct GeneratedReply {
     text: String,
     label: String,
     images: Vec<Vec<u8>>,
+    files: Vec<(String, Vec<u8>)>,
 }
 
 impl Config {
@@ -391,7 +399,7 @@ impl State {
             }));
         }
         messages.push(json!({"role": "user", "content": prompt}));
-        let ((text, images), label) =
+        let ((text, images, files), label) =
             endpoints::retry_in_order(self.attempts_for(model), |attempt| {
                 self.complete_chat_attempt(&messages, attempt)
             })
@@ -400,6 +408,7 @@ impl State {
             text,
             label,
             images,
+            files,
         })
     }
 
@@ -407,11 +416,12 @@ impl State {
         &self,
         base_messages: &[Value],
         attempt: endpoints::Attempt,
-    ) -> Result<(String, Vec<Vec<u8>>), String> {
+    ) -> Result<(String, Vec<Vec<u8>>, Vec<(String, Vec<u8>)>), String> {
         // Chat tools are read-only, so a failed later round retries from the original messages.
         let mut messages = base_messages.to_vec();
         let mut used_weather = false;
         let mut images = Vec::new();
+        let mut files = Vec::new();
         for _ in 0..4 {
             let payload = self
                 .post_chat_attempt(&attempt, &messages, Some(self.memory_mcp.chat_tools()), 90)
@@ -459,6 +469,31 @@ impl State {
                                     Err(error) => value = json!({"error": error}),
                                 }
                             }
+                            if name == "export_file" {
+                                match export::detach_file(&mut value) {
+                                    Ok(Some((filename, bytes))) => {
+                                        if export::can_attach_export(images.len(), files.len()) {
+                                            let used: Vec<&str> = files
+                                                .iter()
+                                                .map(|(name, _): &(String, Vec<u8>)| name.as_str())
+                                                .collect();
+                                            let filename =
+                                                export::unique_filename(&used, &filename);
+                                            if let Some(object) = value.as_object_mut() {
+                                                object.insert(
+                                                    "filename".into(),
+                                                    json!(filename.clone()),
+                                                );
+                                            }
+                                            files.push((filename, bytes));
+                                        } else {
+                                            value = json!({"error": "Only 10 files can be attached to one reply."});
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => value = json!({"error": error}),
+                                }
+                            }
                             value.to_string()
                         }
                         Err(error) => json!({"error":error}).to_string(),
@@ -470,7 +505,7 @@ impl State {
                 if used_weather && !response.to_ascii_lowercase().contains("open-meteo") {
                     response.push_str("\n\nWeather data: Open-Meteo (https://open-meteo.com/).");
                 }
-                return Ok((response, images));
+                return Ok((response, images, files));
             }
         }
         Err("The AI made too many consecutive tool requests.".into())
@@ -953,9 +988,14 @@ async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> 
     Ok(())
 }
 
-fn visible_reply(text: &str, label: &str, has_chart: bool) -> String {
-    let text = if has_chart && text.trim().is_empty() {
-        "Here's the chart."
+fn visible_reply(text: &str, label: &str, has_chart: bool, has_file: bool) -> String {
+    let text = if text.trim().is_empty() {
+        match (has_chart, has_file) {
+            (true, true) => "Here's the chart and the file.",
+            (true, false) => "Here's the chart.",
+            (false, true) => "Here's the file.",
+            (false, false) => text,
+        }
     } else {
         text
     };
@@ -977,11 +1017,25 @@ fn chart_attachments(images: &[Vec<u8>]) -> Vec<CreateAttachment> {
         .collect()
 }
 
+fn reply_attachments(images: &[Vec<u8>], files: &[(String, Vec<u8>)]) -> Vec<CreateAttachment> {
+    let files = files
+        .iter()
+        .map(|(name, bytes)| CreateAttachment::bytes(bytes.clone(), name.clone()))
+        .collect::<Vec<_>>();
+    let mut attachments = chart_attachments(images);
+    let room = export::MAX_REPLY_ATTACHMENTS.saturating_sub(files.len());
+    attachments.truncate(room);
+    attachments.extend(files);
+    attachments.truncate(export::MAX_REPLY_ATTACHMENTS);
+    attachments
+}
+
 async fn reply_with_retry(
     ctx: &Context,
     message: &Message,
     content: impl Into<String>,
     images: &[Vec<u8>],
+    files: &[(String, Vec<u8>)],
 ) -> BotResult<()> {
     let mut builder = CreateMessage::new()
         .content(content.into())
@@ -992,8 +1046,9 @@ async fn reply_with_retry(
         )
         .label("Change model")
         .style(ButtonStyle::Secondary)])]);
-    if !images.is_empty() {
-        builder = builder.add_files(chart_attachments(images));
+    let attachments = reply_attachments(images, files);
+    if !attachments.is_empty() {
+        builder = builder.add_files(attachments);
     }
     let sent = message.channel_id.send_message(&ctx.http, builder).await?;
     if let Err(error) = sent
@@ -1365,10 +1420,11 @@ impl Handler {
             &generated.text,
             &generated.label,
             !generated.images.is_empty(),
+            !generated.files.is_empty(),
         );
         for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk, &generated.images).await?;
+                reply_with_retry(ctx, message, chunk, &generated.images, &generated.files).await?;
             } else {
                 reply(ctx, message, chunk).await?;
             }
@@ -1493,10 +1549,11 @@ impl Handler {
             &generated.text,
             &generated.label,
             !generated.images.is_empty(),
+            !generated.files.is_empty(),
         );
         for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk, &generated.images).await?;
+                reply_with_retry(ctx, message, chunk, &generated.images, &generated.files).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1617,7 +1674,7 @@ impl Handler {
         let response = endpoints::append_provider_label(&response, &label);
         for (index, chunk) in split_discord_message(&response).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk, &[]).await?;
+                reply_with_retry(ctx, message, chunk, &[], &[]).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1632,7 +1689,7 @@ impl Handler {
         } else {
             "Wake names are disabled.".into()
         };
-        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a chart image, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.\nPress Change model on an answer, then pick the new model from the list.")).await
+        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a chart image, a dice roll, weather, or a quote.\nAsk me to export an Excel sheet, Markdown, text, or code, and I'll attach one Markdown file.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.\nPress Change model on an answer, then pick the new model from the list.")).await
     }
 
     async fn handle_command(
@@ -2214,6 +2271,26 @@ mod tests {
         assert_eq!(
             strip_wake_name("mộc, chào!", &vietnamese_name),
             Some("chào!")
+        );
+    }
+
+    #[test]
+    fn empty_caption_names_a_chart_or_a_file() {
+        assert_eq!(
+            visible_reply("", "openai/gpt-4o-mini", false, true),
+            "Here's the file.\n\nopenai/gpt-4o-mini"
+        );
+        assert_eq!(
+            visible_reply("  ", "openai/gpt-4o-mini", true, true),
+            "Here's the chart and the file.\n\nopenai/gpt-4o-mini"
+        );
+        assert_eq!(
+            visible_reply("", "openai/gpt-4o-mini", true, false),
+            "Here's the chart.\n\nopenai/gpt-4o-mini"
+        );
+        assert_eq!(
+            visible_reply("Saved it.", "openai/gpt-4o-mini", false, true),
+            "Saved it.\n\nopenai/gpt-4o-mini"
         );
     }
 

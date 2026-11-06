@@ -538,6 +538,7 @@ mod tests {
                 "roll_dice",
                 "define_word",
                 "search_encyclopedia",
+                "export_file",
                 "future_lookup"
             ]
         );
@@ -560,6 +561,25 @@ mod tests {
         assert_eq!(
             plot["function"]["parameters"]["properties"]["series"]["maxItems"],
             3
+        );
+        let export_file = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "export_file")
+            .unwrap();
+        assert_eq!(
+            export_file["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            export_file["function"]["parameters"]["properties"]["parts"]["items"]["properties"]
+                ["kind"]["enum"],
+            json!(["excel", "markdown", "text", "code"])
+        );
+        assert!(
+            export_file["function"]["parameters"]["properties"]["parts"]["items"]["properties"]
+                ["body"]
+                .get("maxLength")
+                .is_none()
         );
     }
 
@@ -619,7 +639,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 16);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 17);
         assert!(tools["result"]["tools"]
             .as_array()
             .unwrap()

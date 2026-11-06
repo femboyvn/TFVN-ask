@@ -98,11 +98,12 @@ The chat model can call these tools. It is instructed to use them for live facts
 | The current time | `current_time` | The host clock, shown as UTC and as a Discord timestamp |
 | Arithmetic | `calculate` | A local parser (`+`, `-`, `*`, `/`, parentheses, decimals, postfix `!`) |
 | A chart of numbers or a formula | `plot` | A PNG chart (`line`, `bar`, or `scatter`) drawn by matplotlib in the Docker image |
+| An Excel sheet, Markdown note, text, or code file | `export_file` | One Markdown attachment that bundles the requested parts |
 | A dice roll | `roll_dice` | The host CSPRNG. Default is one six-sided die |
 | An English definition | `define_word` | [Free Dictionary API](https://dictionaryapi.dev/) |
 | Background facts | `search_encyclopedia` | [English Wikipedia](https://en.wikipedia.org/) |
 
-Weather results are model forecasts, not official warnings. The quote API has no topic filter. Dictionary and Wikipedia results can be incomplete. Give a city for weather. The bot does not guess a member's location. A chart uses the numbers or formula in the request. The Docker image attaches it as a PNG. A host without Python 3 and matplotlib cannot draw one.
+Weather results are model forecasts, not official warnings. The quote API has no topic filter. Dictionary and Wikipedia results can be incomplete. Give a city for weather. The bot does not guess a member's location. A chart uses the numbers or formula in the request. The Docker image attaches it as a PNG. A host without Python 3 and matplotlib cannot draw one. An export request becomes one Markdown file attached to the reply. A sheet inside that file is a table plus a CSV block. The file is as long as the request, up to 8 MiB.
 
 The bot needs outbound HTTPS to Discord, your chat API, and the sources above.
 

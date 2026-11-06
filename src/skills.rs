@@ -1,6 +1,7 @@
 //! Read-only chat tools for live information and local utilities.
 
 use crate::calculator;
+use crate::export;
 use crate::knowledge;
 use crate::plot;
 use rand::{rngs::OsRng, Rng};
@@ -83,6 +84,19 @@ pub fn tool_definitions() -> Vec<Value> {
             "inputSchema":{"type":"object","properties":{
                 "query":{"type":"string","minLength":2,"maxLength":120,"description":"Topic or factual question to search"}
             },"required":["query"],"additionalProperties":false}
+        }),
+        json!({
+            "name":"export_file",
+            "description":"Bundle an Excel sheet, Markdown, plain text, or source code into one Markdown file when the member asks to export, download, or save it. Do not call it for a normal answer. Do not invent rows, code, or text, and do not shorten the file to fit a chat message: include the full text they asked for. filename is the download name, 1 to 60 characters, using letters, digits, spaces, and . _ -. The bot attaches it with a .md suffix. parts is 1 to 8 objects in order. kind is excel, markdown, text, or code. body is the text. For excel, body is CSV with a header row and the same number of columns in every row. For code, language is required, such as python, rust, or c++. title is an optional heading. A single markdown part is stored as the file body; other requests become sections of one file. When the result says file_attached, write a short caption only. The bot attaches the Markdown file.",
+            "inputSchema":{"type":"object","properties":{
+                "filename":{"type":"string","minLength":1,"maxLength":60,"description":"Download name. The bot uses a .md suffix."},
+                "parts":{"type":"array","minItems":1,"maxItems":8,"description":"Requested pieces, in order.","items":{"type":"object","properties":{
+                    "kind":{"type":"string","enum":["excel","markdown","text","code"],"description":"excel is a sheet, markdown and text are prose, and code is source."},
+                    "title":{"type":"string","minLength":1,"description":"Optional section heading."},
+                    "language":{"type":"string","minLength":1,"maxLength":20,"description":"Code language, such as python, rust, or c++. Required for code."},
+                    "body":{"type":"string","minLength":1,"description":"Full requested text. For excel, CSV with a header row. No length cap other than the finished file size."}
+                },"required":["kind","body"],"additionalProperties":false}}
+            },"required":["filename","parts"],"additionalProperties":false}
         }),
     ]
 }
@@ -233,6 +247,15 @@ pub async fn call(client: &Client, name: &str, arguments: &Value) -> Result<Valu
                 .and_then(Value::as_str)
                 .ok_or("Missing query")?;
             knowledge::search_encyclopedia(client, query).await
+        }
+        "export_file" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Export arguments must be an object")?;
+            if object.keys().any(|key| !export::accepts_argument(key)) {
+                return Err("Unknown export argument".into());
+            }
+            export::build(arguments)
         }
         _ => Err("Unknown skill tool".into()),
     }
@@ -769,6 +792,21 @@ mod tests {
         assert_eq!(
             call(&client, "plot", &json!([])).await.unwrap_err(),
             "Plot arguments must be an object"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_tool_rejects_unknown_arguments() {
+        let client = Client::new();
+        assert_eq!(
+            call(&client, "export_file", &json!({"topic": "notes"}))
+                .await
+                .unwrap_err(),
+            "Unknown export argument"
+        );
+        assert_eq!(
+            call(&client, "export_file", &json!([])).await.unwrap_err(),
+            "Export arguments must be an object"
         );
     }
 }

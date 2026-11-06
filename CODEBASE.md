@@ -30,9 +30,10 @@ If `FORUM_TYPE_CHANNEL` is set, startup resolves the channel, requires `ChannelT
 | `src/forum.rs` | Forum tags, eligibility, shared thread context, title cleanup, activation file |
 | `src/mcp.rs` | MCP server and client, tool catalog, scope injection |
 | `src/storage.rs` | Conversation and memory JSON stores, preference validation |
-| `src/skills.rs` | Weather, quotes, clock, dice, charts, and dispatch into calculator, knowledge, and plot |
+| `src/skills.rs` | Weather, quotes, clock, dice, charts, exports, and dispatch into calculator, knowledge, plot, and export |
 | `src/calculator.rs` | Arithmetic parser used by the `calculate` and `plot` tools |
 | `src/plot.rs` | Line, bar, and scatter sampling. `src/plot.py` draws the PNG with matplotlib |
+| `src/export.rs` | Markdown bundle for an Excel sheet, note, text, or source the member asked to download |
 | `src/knowledge.rs` | Free Dictionary API and English Wikipedia search |
 
 ## Message dispatch
@@ -78,7 +79,7 @@ Normal chat holds a mutex keyed by `{guild}:{user}` so one member's turns cannot
 6. Up to four model rounds with `chat_tools`. Each round may contain at most four tool calls. Tool errors are returned to the model as `{"error":...}`. A finished answer that used `weather` and omitted the word `open-meteo` gets an Open-Meteo line appended.
 7. `retry_in_order` walks `EndpointSet::attempts`. The preferred model is tried first, on each endpoint that lists it, then the other configured models, at most four attempts. `FALLBACK_MODEL`, set to `provider/model`, replaces that other-model walk with that one pair. Transport failures, HTTP errors, empty completions, and tool-loop failures try the next attempt. Chat tools are read-only, so a failed attempt starts again from the original messages.
 
-The Discord reply ends with `provider/model` for the attempt that answered, for example `openai/gpt-4o-mini`. That label is not stored in conversation history. The first Discord chunk replies to the member without pinging them and gets a 🔄 reaction and a Change model button. Later chunks are plain messages. Chunks are at most 1900 characters, split on a newline or space when one sits in the second half of the window.
+The Discord reply ends with `provider/model` for the attempt that answered, for example `openai/gpt-4o-mini`. That label is not stored in conversation history. The first Discord chunk replies to the member without pinging them and gets a 🔄 reaction and a Change model button. Later chunks are plain messages. Chunks are at most 1900 characters, split on a newline or space when one sits in the second half of the window. The first chunk also carries any chart images and export files. Export bytes are removed from the tool result before the model sees it, and conversation history stores the caption.
 
 The member who sent the original message can add that 🔄 reaction once. The bot removes its reaction from that answer and posts a new one with its own 🔄. Another try uses the new answer's reaction. The bot's own reaction does not count, and the reaction only works on a message the bot itself marked. If the retry does not post a new answer, the same 🔄 is put back. Cooldown and the per-member lock still apply. In a forum thread the retry skips the one-answer guard and posts another reply. Operational replies, help, and errors do not get the reaction. The bot needs the **Add Reactions** permission.
 
@@ -145,6 +146,7 @@ Preference limits:
 | `roll_dice` | `OsRng` | `count` 1–20 (default 1), `sides` 2–1000 (default 6), `modifier` −1000..1000 (default 0). |
 | `define_word` | `api.dictionaryapi.dev` | English word, 1–60 letters plus space, hyphen, or apostrophe. Up to five definitions. |
 | `search_encyclopedia` | English Wikipedia API | Query 2–120 characters. Up to three intro extracts. User-Agent `KnownSphereBot/{version}`. |
+| `export_file` | Local Markdown bundle | One `.md` attachment. Parts are `excel` (a table plus a CSV block), `markdown`, `text`, or `code`, at most 8. The file follows the requested text, up to 8 MiB, and is not clipped to the Discord message limit. A single markdown part is the file body. |
 
 Skill HTTP calls time out after 10 seconds. Each chat attempt uses a 90-second read budget plus 10 seconds of client timeout. The router and forum titles use 30 seconds per attempt. The MCP client waits 30 seconds for one response line.
 

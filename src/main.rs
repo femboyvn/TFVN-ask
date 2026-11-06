@@ -3,6 +3,7 @@ mod endpoints;
 mod forum;
 mod knowledge;
 mod mcp;
+mod plot;
 mod skills;
 mod storage;
 
@@ -18,9 +19,9 @@ use serenity::all::{
     MessageId, MessageReaction, Reaction, ReactionType, Ready,
 };
 use serenity::builder::{
-    CreateActionRow, CreateAllowedMentions, CreateButton, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, EditThread, GetMessages,
+    CreateActionRow, CreateAllowedMentions, CreateAttachment, CreateButton,
+    CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateSelectMenu,
+    CreateSelectMenuKind, CreateSelectMenuOption, EditThread, GetMessages,
 };
 use serenity::Client;
 use std::collections::{HashMap, HashSet};
@@ -71,6 +72,11 @@ field: do not pretend a random quote matches a requested theme, and do not inven
 Include the source link when quoting.
 For current time, use current_time and give the UTC time or its Discord timestamp,
 which displays in each reader's local timezone. For arithmetic, use calculate.
+For a graph, chart, or plot, call plot. Pass only numbers or a formula the
+member supplied. y = x! is the formula x!, with postfix factorial. Do not
+invent points or an x range; ask for the range when a formula has none. Do not
+write Python, matplotlib, or other source code. When the tool result says
+image_attached, write a short caption only. The bot attaches the chart image.
 For dice rolls, use roll_dice and report the actual rolls and total.
 For English word meanings, use define_word. For background facts, use
 search_encyclopedia and cite the source page. These sources can be incomplete or
@@ -145,6 +151,7 @@ struct Config {
 struct GeneratedReply {
     text: String,
     label: String,
+    images: Vec<Vec<u8>>,
 }
 
 impl Config {
@@ -384,21 +391,27 @@ impl State {
             }));
         }
         messages.push(json!({"role": "user", "content": prompt}));
-        let (text, label) = endpoints::retry_in_order(self.attempts_for(model), |attempt| {
-            self.complete_chat_attempt(&messages, attempt)
+        let ((text, images), label) =
+            endpoints::retry_in_order(self.attempts_for(model), |attempt| {
+                self.complete_chat_attempt(&messages, attempt)
+            })
+            .await?;
+        Ok(GeneratedReply {
+            text,
+            label,
+            images,
         })
-        .await?;
-        Ok(GeneratedReply { text, label })
     }
 
     async fn complete_chat_attempt(
         &self,
         base_messages: &[Value],
         attempt: endpoints::Attempt,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<Vec<u8>>), String> {
         // Chat tools are read-only, so a failed later round retries from the original messages.
         let mut messages = base_messages.to_vec();
         let mut used_weather = false;
+        let mut images = Vec::new();
         for _ in 0..4 {
             let payload = self
                 .post_chat_attempt(&attempt, &messages, Some(self.memory_mcp.chat_tools()), 90)
@@ -437,8 +450,15 @@ impl State {
                         _ => Err("Invalid tool arguments".into()),
                     };
                     let content = match result {
-                        Ok(value) => {
+                        Ok(mut value) => {
                             used_weather |= name == "weather";
+                            if name == "plot" {
+                                match plot::detach_image(&mut value) {
+                                    Ok(Some(bytes)) => images.push(bytes),
+                                    Ok(None) => {}
+                                    Err(error) => value = json!({"error": error}),
+                                }
+                            }
                             value.to_string()
                         }
                         Err(error) => json!({"error":error}).to_string(),
@@ -450,7 +470,7 @@ impl State {
                 if used_weather && !response.to_ascii_lowercase().contains("open-meteo") {
                     response.push_str("\n\nWeather data: Open-Meteo (https://open-meteo.com/).");
                 }
-                return Ok(response);
+                return Ok((response, images));
             }
         }
         Err("The AI made too many consecutive tool requests.".into())
@@ -933,26 +953,49 @@ async fn reply(ctx: &Context, message: &Message, content: impl Into<String>) -> 
     Ok(())
 }
 
+fn visible_reply(text: &str, label: &str, has_chart: bool) -> String {
+    let text = if has_chart && text.trim().is_empty() {
+        "Here's the chart."
+    } else {
+        text
+    };
+    endpoints::append_provider_label(text, label)
+}
+
+fn chart_attachments(images: &[Vec<u8>]) -> Vec<CreateAttachment> {
+    images
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let name = if index == 0 {
+                "plot.png".to_owned()
+            } else {
+                format!("plot-{}.png", index + 1)
+            };
+            CreateAttachment::bytes(bytes.clone(), name)
+        })
+        .collect()
+}
+
 async fn reply_with_retry(
     ctx: &Context,
     message: &Message,
     content: impl Into<String>,
+    images: &[Vec<u8>],
 ) -> BotResult<()> {
-    let sent = message
-        .channel_id
-        .send_message(
-            &ctx.http,
-            CreateMessage::new()
-                .content(content.into())
-                .reference_message(message)
-                .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
-                .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
-                    CHANGE_MODEL_BUTTON,
-                )
-                .label("Change model")
-                .style(ButtonStyle::Secondary)])]),
+    let mut builder = CreateMessage::new()
+        .content(content.into())
+        .reference_message(message)
+        .allowed_mentions(CreateAllowedMentions::new().replied_user(false))
+        .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+            CHANGE_MODEL_BUTTON,
         )
-        .await?;
+        .label("Change model")
+        .style(ButtonStyle::Secondary)])]);
+    if !images.is_empty() {
+        builder = builder.add_files(chart_attachments(images));
+    }
+    let sent = message.channel_id.send_message(&ctx.http, builder).await?;
     if let Err(error) = sent
         .react(&ctx.http, ReactionType::Unicode(RETRY_EMOJI.to_owned()))
         .await
@@ -1318,10 +1361,14 @@ impl Handler {
                 return reply(ctx, message, format!("I couldn't reply just now: {error}")).await;
             }
         };
-        let visible = endpoints::append_provider_label(&generated.text, &generated.label);
+        let visible = visible_reply(
+            &generated.text,
+            &generated.label,
+            !generated.images.is_empty(),
+        );
         for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk).await?;
+                reply_with_retry(ctx, message, chunk, &generated.images).await?;
             } else {
                 reply(ctx, message, chunk).await?;
             }
@@ -1442,10 +1489,14 @@ impl Handler {
                 return Ok(());
             }
         };
-        let visible = endpoints::append_provider_label(&generated.text, &generated.label);
+        let visible = visible_reply(
+            &generated.text,
+            &generated.label,
+            !generated.images.is_empty(),
+        );
         for (index, chunk) in split_discord_message(&visible).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk).await?;
+                reply_with_retry(ctx, message, chunk, &generated.images).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1566,7 +1617,7 @@ impl Handler {
         let response = endpoints::append_provider_label(&response, &label);
         for (index, chunk) in split_discord_message(&response).into_iter().enumerate() {
             if index == 0 {
-                reply_with_retry(ctx, message, chunk).await?;
+                reply_with_retry(ctx, message, chunk, &[]).await?;
             } else {
                 send_plain(ctx, message, chunk).await?;
             }
@@ -1581,7 +1632,7 @@ impl Handler {
         } else {
             "Wake names are disabled.".into()
         };
-        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.\nPress Change model on an answer, then pick the new model from the list.")).await
+        reply(ctx, message, format!("Hewwo~ I'm KnownSphere, your cozy chat buddy! (｡･ω･｡)ﾉ♡\n`{prefix} ask <message>` - chat with me\n`{prefix} <message>` - quick chat\n`{prefix} new` - start a fresh conversation in this channel\n`{prefix} summarize [1-100]` - summarize recent messages\n`{prefix} actions [1-100]` - find explicit action items\n`{prefix} decisions [1-100]` - list decisions and open questions\n`{prefix} help` - show this help\n{wake_line}\nAsk me for definitions, background facts, the current time, arithmetic, a chart image, a dice roll, weather, or a quote.\nYou can also ask me to remember a nickname, show what I remember, forget you, or turn memory off/on.\nMention me or reply to one of my messages to chat.\nReact with 🔄 on an answer to try it once. To try again, react on the new answer.\nPress Change model on an answer, then pick the new model from the list.")).await
     }
 
     async fn handle_command(

@@ -11,8 +11,8 @@ FROM debian:bookworm-slim
 # deb.debian.org. Seed apt from the build image, then install the real package.
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /tmp/ca-certificates.crt
 RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get -o Acquire::https::CAInfo=/tmp/ca-certificates.crt update \
-    && apt-get -o Acquire::https::CAInfo=/tmp/ca-certificates.crt install -y --no-install-recommends ca-certificates \
+    && apt-get -o Acquire::https::CAInfo=/tmp/ca-certificates.crt -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::https::CAInfo=/tmp/ca-certificates.crt -o Acquire::Retries=5 install -y --no-install-recommends ca-certificates python3 python3-matplotlib fonts-dejavu-core \
     && rm -f /tmp/ca-certificates.crt \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /data --no-create-home knowsphere \
@@ -22,7 +22,8 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
 COPY --from=build /app/target/release/knowsphere /usr/local/bin/knowsphere
 
 ENV CONVERSATION_STORE_PATH=/data/conversations.json \
-    MEMORY_STORE_PATH=/data/memories.json
+    MEMORY_STORE_PATH=/data/memories.json \
+    MPLBACKEND=Agg
 WORKDIR /data
 USER knowsphere
 VOLUME ["/data"]

@@ -2,6 +2,7 @@
 
 use crate::calculator;
 use crate::knowledge;
+use crate::plot;
 use rand::{rngs::OsRng, Rng};
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -33,10 +34,32 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name":"calculate",
-            "description":"Calculate an arithmetic expression using +, -, *, /, parentheses, and decimal numbers. Use for arithmetic instead of guessing the result.",
+            "description":"Calculate an arithmetic expression using +, -, *, /, parentheses, decimal numbers, and postfix factorial !. Use for arithmetic instead of guessing the result. 5! is 120, and y = x! is written x!.",
             "inputSchema":{"type":"object","properties":{
                 "expression":{"type":"string","minLength":1,"maxLength":200,"description":"Arithmetic expression, for example (12.5 + 7.5) / 2"}
             },"required":["expression"],"additionalProperties":false}
+        }),
+        json!({
+            "name":"plot",
+            "description":"Draw a PNG chart from numbers or a formula the member supplied. Use for a graph, chart, or plot. Do not invent points or an x range, and do not write Python, matplotlib, or other source code. For listed values, pass series: 1 to 3 series for line or scatter, and one series for bar. Each series has 1 to 30 points with a finite y. Give every point an x, or leave x out to space points in order from 1. Labels are optional category names of at most 12 characters; on a line or scatter chart they become the x labels only when every point has one. kind is line, bar, or scatter; the default is line. For a formula, pass expression, x_min, and x_max instead of series. expression uses x with +, -, *, /, parentheses, decimals, and postfix factorial !. y = x! is expression x!. Factorial is undefined at negative integers and grows quickly, so a range such as 0 through 10 is usually enough. samples defaults to 21 and can be 2 through 30. Ask for the x range when the member did not give one. The bot attaches the PNG. When the result says image_attached, write a short caption only.",
+            "inputSchema":{"type":"object","properties":{
+                "kind":{"type":"string","enum":["line","bar","scatter"],"description":"Chart kind; defaults to line"},
+                "title":{"type":"string","minLength":1,"maxLength":60,"description":"Optional chart title"},
+                "x_label":{"type":"string","minLength":1,"maxLength":24,"description":"Optional horizontal axis label"},
+                "y_label":{"type":"string","minLength":1,"maxLength":24,"description":"Optional vertical axis label"},
+                "series":{"type":"array","minItems":1,"maxItems":3,"description":"Values the member supplied. Omit when plotting an expression.","items":{"type":"object","properties":{
+                    "name":{"type":"string","minLength":1,"maxLength":30,"description":"Optional series name"},
+                    "points":{"type":"array","minItems":1,"maxItems":30,"items":{"type":"object","properties":{
+                        "x":{"type":"number","description":"Optional horizontal value. Supply it for every point or for none."},
+                        "y":{"type":"number","description":"Vertical value"},
+                        "label":{"type":"string","minLength":1,"maxLength":12,"description":"Optional category name"}
+                    },"required":["y"],"additionalProperties":false}}
+                },"required":["points"],"additionalProperties":false}},
+                "expression":{"type":"string","minLength":1,"maxLength":200,"description":"Arithmetic formula in x, for example x * x + 1 or x!. Omit when passing series."},
+                "x_min":{"type":"number","description":"Start of the x range for an expression"},
+                "x_max":{"type":"number","description":"End of the x range for an expression"},
+                "samples":{"type":"integer","minimum":2,"maximum":30,"description":"Expression samples from x_min through x_max; defaults to 21"}
+            },"additionalProperties":false}
         }),
         json!({
             "name":"roll_dice",
@@ -137,6 +160,15 @@ pub async fn call(client: &Client, name: &str, arguments: &Value) -> Result<Valu
                 .ok_or("Missing expression")?;
             let result = calculator::evaluate(expression)?;
             Ok(json!({"expression":expression,"result":result}))
+        }
+        "plot" => {
+            let object = arguments
+                .as_object()
+                .ok_or("Plot arguments must be an object")?;
+            if object.keys().any(|key| !plot::accepts_argument(key)) {
+                return Err("Unknown plot argument".into());
+            }
+            plot::render(arguments).await
         }
         "roll_dice" => {
             let object = arguments
@@ -723,5 +755,20 @@ mod tests {
         assert!(call(&client, "current_time", &json!({"offset":7}))
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn plot_tool_rejects_unknown_arguments() {
+        let client = Client::new();
+        assert_eq!(
+            call(&client, "plot", &json!({"topic":"sales"}))
+                .await
+                .unwrap_err(),
+            "Unknown plot argument"
+        );
+        assert_eq!(
+            call(&client, "plot", &json!([])).await.unwrap_err(),
+            "Plot arguments must be an object"
+        );
     }
 }

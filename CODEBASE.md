@@ -30,8 +30,9 @@ If `FORUM_TYPE_CHANNEL` is set, startup resolves the channel, requires `ChannelT
 | `src/forum.rs` | Forum tags, eligibility, shared thread context, title cleanup, activation file |
 | `src/mcp.rs` | MCP server and client, tool catalog, scope injection |
 | `src/storage.rs` | Conversation and memory JSON stores, preference validation |
-| `src/skills.rs` | Weather, quotes, clock, dice, and dispatch into calculator and knowledge |
-| `src/calculator.rs` | Arithmetic parser used by the `calculate` tool |
+| `src/skills.rs` | Weather, quotes, clock, dice, charts, and dispatch into calculator, knowledge, and plot |
+| `src/calculator.rs` | Arithmetic parser used by the `calculate` and `plot` tools |
+| `src/plot.rs` | Line, bar, and scatter sampling. `src/plot.py` draws the PNG with matplotlib |
 | `src/knowledge.rs` | Free Dictionary API and English Wikipedia search |
 
 ## Message dispatch
@@ -139,7 +140,8 @@ Preference limits:
 | `weather` | Open-Meteo geocoding and forecast | City required. Optional `day` (`today`, `tomorrow`, or `YYYY-MM-DD`) and `hour` (0–23, requires `day`). Seven daily rows. Clothing notes and a planning note. Not an official warning. |
 | `quote` | `https://dumbapis.com/quote` or `/daily/quote` | `kind` is `random` (default) or `daily`. No topic filter. Text capped at 800 characters. |
 | `current_time` | Local clock | UTC RFC 3339, unix seconds, and a Discord `<t:unix:F>` timestamp. |
-| `calculate` | `calculator::evaluate` | `+ - * /`, parentheses, decimals, scientific notation, leading signs. Length 1–200. Rejects non-finite results and division by zero. |
+| `calculate` | `calculator::evaluate` | `+ - * /`, parentheses, decimals, scientific notation, leading signs, and postfix factorial `!`. Length 1–200. Rejects non-finite results, division by zero, and factorial of a negative integer. |
+| `plot` | Matplotlib PNG in the Docker image | `kind` is `line` (default), `bar`, or `scatter`. One to three series (a bar chart takes one), each 1–30 finite points. Or an expression in `x` with `x_min` and `x_max`, sampled 2–30 times (default 21). `x!` is factorial, extended with the gamma function between integers. Python only receives the sampled points. The bot attaches `plot.png` and the model writes a caption. Without `python3` and matplotlib the tool returns "The chart renderer is unavailable." |
 | `roll_dice` | `OsRng` | `count` 1–20 (default 1), `sides` 2–1000 (default 6), `modifier` −1000..1000 (default 0). |
 | `define_word` | `api.dictionaryapi.dev` | English word, 1–60 letters plus space, hyphen, or apostrophe. Up to five definitions. |
 | `search_encyclopedia` | English Wikipedia API | Query 2–120 characters. Up to three intro extracts. User-Agent `KnownSphereBot/{version}`. |
@@ -190,7 +192,7 @@ HTTP 401, 403, 404, and 429 map to a one-line hint; other failures stay generic.
 
 ## Packaging
 
-`Dockerfile` builds with `rust:1.94-bookworm` and `cargo build --release --locked`, then copies the binary onto `debian:bookworm-slim`. The image installs CA certificates, creates user `knowsphere` (uid 10001, home `/data`), and sets both store paths under `/data`. The volume is `/data`. `.dockerignore` sends only the manifest, lockfile, Dockerfile, and `src/`.
+`Dockerfile` builds with `rust:1.94-bookworm` and `cargo build --release --locked`, then copies the binary onto `debian:bookworm-slim`. The image installs CA certificates, Python 3, matplotlib, and DejaVu fonts, creates user `knowsphere` (uid 10001, home `/data`), and sets both store paths under `/data`. `MPLBACKEND` is `Agg`. The volume is `/data`. `.dockerignore` sends only the manifest, lockfile, Dockerfile, and `src/`. The chart script is compiled into the binary from `src/plot.py`.
 
 `.github/workflows/build.yml` on `main` runs fmt, clippy (`-D warnings`), and `cargo test --locked`. Pushes also build Windows and macOS release artifacts and push `ghcr.io/<repo>:main` and `:sha-<commit>`.
 

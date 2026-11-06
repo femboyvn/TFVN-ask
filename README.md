@@ -96,12 +96,13 @@ The chat model can call these tools. It is instructed to use them for live facts
 | Weather, clothes, travel, or an outdoor plan | `weather` | [Open-Meteo](https://open-meteo.com/) |
 | A random quote or the quote of the day | `quote` | [Dumb APIs](https://dumbapis.com/) public-domain excerpts |
 | The current time | `current_time` | The host clock, shown as UTC and as a Discord timestamp |
-| Arithmetic | `calculate` | A local parser (`+`, `-`, `*`, `/`, parentheses, decimals) |
+| Arithmetic | `calculate` | A local parser (`+`, `-`, `*`, `/`, parentheses, decimals, postfix `!`) |
+| A chart of numbers or a formula | `plot` | A PNG chart (`line`, `bar`, or `scatter`) drawn by matplotlib in the Docker image |
 | A dice roll | `roll_dice` | The host CSPRNG. Default is one six-sided die |
 | An English definition | `define_word` | [Free Dictionary API](https://dictionaryapi.dev/) |
 | Background facts | `search_encyclopedia` | [English Wikipedia](https://en.wikipedia.org/) |
 
-Weather results are model forecasts, not official warnings. The quote API has no topic filter. Dictionary and Wikipedia results can be incomplete. Give a city for weather. The bot does not guess a member's location.
+Weather results are model forecasts, not official warnings. The quote API has no topic filter. Dictionary and Wikipedia results can be incomplete. Give a city for weather. The bot does not guess a member's location. A chart uses the numbers or formula in the request. The Docker image attaches it as a PNG. A host without Python 3 and matplotlib cannot draw one.
 
 The bot needs outbound HTTPS to Discord, your chat API, and the sources above.
 

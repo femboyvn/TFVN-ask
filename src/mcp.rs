@@ -534,6 +534,7 @@ mod tests {
                 "quote",
                 "current_time",
                 "calculate",
+                "plot",
                 "roll_dice",
                 "define_word",
                 "search_encyclopedia",
@@ -543,6 +544,22 @@ mod tests {
         assert_eq!(
             tools[0]["function"]["parameters"]["properties"]["day"]["type"],
             "string"
+        );
+        let plot = tools
+            .iter()
+            .find(|tool| tool["function"]["name"] == "plot")
+            .unwrap();
+        assert_eq!(
+            plot["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            plot["function"]["parameters"]["properties"]["kind"]["enum"],
+            json!(["line", "bar", "scatter"])
+        );
+        assert_eq!(
+            plot["function"]["parameters"]["properties"]["series"]["maxItems"],
+            3
         );
     }
 
@@ -602,7 +619,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 15);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 16);
         assert!(tools["result"]["tools"]
             .as_array()
             .unwrap()

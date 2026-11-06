@@ -1,6 +1,8 @@
 services:
   knowsphere:
-    build: .
+    build:
+      context: .
+      network: host
     image: knowsphere
     env_file:
       - .env
